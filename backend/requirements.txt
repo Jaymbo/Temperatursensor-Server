@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+watchdog
+numpy
+pytest
+pytest-cov
+flake8
+black
+isort
+requests
+httpx

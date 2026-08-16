@@ -1,0 +1,33 @@
+services:
+  frontend:
+    build:
+      context: ./temperature-dashboard
+      dockerfile: Dockerfile
+    container_name: temp-dashboard
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      - TZ=Europe/Berlin
+
+  backend:
+    build:
+      context: ./backend
+    container_name: temp-backend
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Berlin
+      - PYTHONDONTWRITEBYTECODE=1
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_OWNER=Jaymbo
+      - GITHUB_REPO=Temperatursensor-Server
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    volumes:
+      # Komplettes Repo mounten → git pull ändert live die Dateien
+      - .:/project
+      # Docker-Sockel für automatischen Frontend-Neubuild
+      - /var/run/docker.sock:/var/run/docker.sock:rw

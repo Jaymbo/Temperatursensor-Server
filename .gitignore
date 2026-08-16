@@ -1,0 +1,8 @@
+.env
+backend/database.db
+backend/password.conf
+*/__pycache__/*
+*/*/__pycache__/*
+*/.venv/
+backend/htmlcov/backend/.coverage
+backend/.coverage
