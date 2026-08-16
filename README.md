@@ -7,12 +7,12 @@ Produktionsserver für das Temperatur-Monitoring-System.
 ```
 ┌─────────────┐      HTTP POST /measurements      ┌──────────────────┐
 │ ESP8266     │ ────────────────────────────────► │  FastAPI backend │
-│ sensor node │      POST /update/{sensor_id}     │  SQLite database   │
+│ sensor node │      POST /update/{sensor_id}     │  SQLite database │
 └─────────────┘                                   └────────┬─────────┘
-                                                         │
-                                    WebSocket /ws, REST  │
-                                    ┌────────────────────┘
-                                    ▼
+                                                           │
+                                      WebSocket /ws, REST  │
+                                      ┌────────────────────┘
+                                      ▼
                            ┌────────────────────┐
                            │ React/Vite dashboard
                            │ (nginx, static files)
