@@ -250,7 +250,26 @@ function App() {
             {version}
           </div>
         )}
-        <h1 style={{ margin: 0, fontSize: "5vh" }}>Temperaturdaten</h1>
+        <div style={{ display: "flex", alignItems: "center", gap: "1vw" }}>
+          <svg width="4vh" height="4vh" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <g id="sn-arm">
+                <line x1="50" y1="12" x2="50" y2="50"/>
+                <polyline points="44,22 50,26 56,22"/>
+                <polyline points="43,32 50,35 57,32"/>
+              </g>
+            </defs>
+            <g stroke="#007bff" strokeWidth="2.5" strokeLinecap="round" fill="none" transform="translate(50,50) scale(1.2) translate(-50,-50)">
+              <use href="#sn-arm"/>
+              <use href="#sn-arm" transform="rotate(60,50,50)"/>
+              <use href="#sn-arm" transform="rotate(120,50,50)"/>
+              <use href="#sn-arm" transform="rotate(180,50,50)"/>
+              <use href="#sn-arm" transform="rotate(240,50,50)"/>
+              <use href="#sn-arm" transform="rotate(300,50,50)"/>
+            </g>
+          </svg>
+          <h1 style={{ margin: 0, fontSize: "5vh" }}>Temperaturdaten</h1>
+        </div>
         <div style={{ position: "absolute", top: 0, left: "25vw", textAlign: "left" }}>
           {sensorSessions && sensorSessions.length > 0 && sensorSessions
             .filter((session) => session.sensor_session && session.sensor_session.startsWith("None_"))

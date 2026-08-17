@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="32" height="32">
-  <g stroke="#007bff" stroke-width="2.5" stroke-linecap="round" fill="none">
+  <g stroke="#007bff" stroke-width="2.5" stroke-linecap="round" fill="none" transform="translate(50,50) scale(1.2) translate(-50,-50)">
     <!-- Ein Strahl mit 3 Zacken (nach oben) -->
     <g id="arm">
       <line x1="50" y1="12" x2="50" y2="50"/>
