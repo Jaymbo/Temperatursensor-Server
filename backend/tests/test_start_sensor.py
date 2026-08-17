@@ -8,7 +8,7 @@ def test_start_sensor_creates_new_entry(client):
         data = res.json()
         assert data["status"] == "success"
         assert data["entry_id"] == "None_42"
-        mock_add.assert_called_once_with("Test Text", 60.0, 10)
+        mock_add.assert_called_once_with("Test Text", 10.0, 60)
 
 
 def test_start_sensor_handles_exception(client):

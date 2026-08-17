@@ -22,8 +22,8 @@ def initialize_db():
             start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             calibration_data TEXT,
             custom_text TEXT,
-            messintervall REAL DEFAULT 60.0,
-            sendpuffer INTEGER DEFAULT 10
+            messintervall REAL DEFAULT 10.0,
+            sendpuffer INTEGER DEFAULT 60
         )
         """
     )
@@ -61,9 +61,9 @@ def initialize_db():
     cursor.execute("PRAGMA table_info(sessions)")
     columns = [row[1] for row in cursor.fetchall()]
     if "messintervall" not in columns:  # pragma: no cover (Migration, Spalte existiert bereits im CREATE TABLE)
-        cursor.execute("ALTER TABLE sessions ADD COLUMN messintervall REAL DEFAULT 60.0")  # pragma: no cover
+        cursor.execute("ALTER TABLE sessions ADD COLUMN messintervall REAL DEFAULT 10.0")  # pragma: no cover
     if "sendpuffer" not in columns:  # pragma: no cover (Migration, Spalte existiert bereits im CREATE TABLE)
-        cursor.execute("ALTER TABLE sessions ADD COLUMN sendpuffer INTEGER DEFAULT 10")  # pragma: no cover
+        cursor.execute("ALTER TABLE sessions ADD COLUMN sendpuffer INTEGER DEFAULT 60")  # pragma: no cover
     if "correction_points" not in columns:
         cursor.execute("ALTER TABLE sessions ADD COLUMN correction_points TEXT")
     conn.commit()
@@ -325,7 +325,7 @@ def process_relative_data(timestamps: list[float], temperatures: list[float]):
 
     return absolute_timestamps, absolute_temperatures
 
-def clone_latest_session_with_calibration(sensor_id: str, messintervall: float = 60.0, sendpuffer: int = 10):
+def clone_latest_session_with_calibration(sensor_id: str, messintervall: float = 10.0, sendpuffer: int = 60):
     """Erstellt eine neue Session für einen Sensor.
 
     Regeln:
@@ -407,7 +407,7 @@ def clone_latest_session_with_calibration(sensor_id: str, messintervall: float =
     finally:
         conn.close()
 
-def add_or_update_custom_text_entry(custom_text: str, messintervall: float = 60.0, sendpuffer: int = 10):
+def add_or_update_custom_text_entry(custom_text: str, messintervall: float = 10.0, sendpuffer: int = 60):
     """
     Fügt einen neuen Eintrag mit nur custom_text hinzu oder überschreibt den neuesten bestehenden Eintrag,
     bei dem nur id und custom_text gefüllt sind und der Rest leer ist.

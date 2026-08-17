@@ -357,8 +357,8 @@ async def start_sensor(payload: dict):
     """
     try:
         custom_text = payload.get("custom_text", "")
-        messintervall = payload.get("messintervall", 60.0)
-        sendpuffer = payload.get("sendpuffer", 10)
+        messintervall = payload.get("messintervall", 10.0)
+        sendpuffer = payload.get("sendpuffer", 60)
         entry_id = f"None_{add_or_update_custom_text_entry(custom_text, messintervall, sendpuffer)}"
         print(f"Custom text: {custom_text}")  # Debugging-Log
         print(f"Neuer Eintrag erstellt oder aktualisiert: {entry_id}")  # Debugging-Log
