@@ -170,15 +170,15 @@ class TestIncrementalCalibrationEndpoint:
         corrected = apply_correction(10.0, cp)
         assert abs(corrected - 16.0) < 0.01
 
-    def test_two_point_incremental(self, client):
+    def test_calibrate_is_preview_only_no_merge(self, client):
         """
-        Kalibrierung #1: Roh 0→5 (delta+5), Roh 10→15 (delta+10)
-        Kalibrierung #2: User klickt bei Roh 5, sagt "soll 8 sein"
-        → delta = 3, neues Point {t:5, d:3} wird gemerged
-        → gemerged: {t:0,d:5}, {t:5,d:3}, {t:10,d:10}
+        POST /calibrate ist eine reine Vorschau: es wird NICHTS mit dem
+        DB-Stand gemerged. Die gesendeten Punkte bilden die (einzige)
+        Punktmenge.
         """
         sensor_id = "inc3"
         self._ensure_session(sensor_id)
+        # DB enthält bereits Punkte – dürfen NICHT in die Vorschau einfließen
         self._store_correction(
             sensor_id, json.dumps([{"t": 0.0, "delta": 5.0}, {"t": 10.0, "delta": 10.0}])
         )
@@ -191,7 +191,10 @@ class TestIncrementalCalibrationEndpoint:
         assert res.status_code == 200
         result = res.json()
         cp = result["correction_points"]
-        assert len(cp) == 3
+        # Kein Merge: nur der gesendete Punkt, DB-Stand wird ignoriert
+        assert len(cp) == 1
+        assert abs(cp[0]["t"] - 5.0) < 0.01
+        assert abs(cp[0]["delta"] - 3.0) < 0.01
         # Bei Roh=5 sollte korrigiert ~8 sein
         corrected = apply_correction(5.0, cp)
         assert abs(corrected - 8.0) < 0.01
@@ -219,12 +222,13 @@ class TestIncrementalCalibrationEndpoint:
         assert abs(cp[0]["delta"] - 3.0) < 0.01
         assert abs(apply_correction(10.0, cp) - 13.0) < 0.01
 
-    def test_user_scenario_raw_33_plus1_then_minus4(self, client):
+    def test_calibrate_then_apply_replaces_not_accumulates(self, client):
         """
-        Reproduziert das gemeldete Problem:
-        1. Roh 33, erste Kalibrierung: soll 34 sein (delta+1)
-        2. Zweite: soll 29.9 sein (delta-3.1)
-        → _calibrated muss variierende Werte zeigen, nicht alles auf 29.9
+        Neues Verhalten:
+        1. POST /calibrate ist eine reine Vorschau – schreibt NICHTS in die DB
+           und mergt NICHT mit bestehenden Punkten.
+        2. POST /calibration persistiert und ERSETZT die alten Punkte.
+        3. _calibrated-Preview liest den persistenten (eretzten) Stand.
         """
         import sqlite3
 
@@ -235,7 +239,6 @@ class TestIncrementalCalibrationEndpoint:
         conn = sqlite3.connect(dbmod.DB_PATH)
         cur = conn.cursor()
         session_id = dbmod.get_latest_session_for_sensor_id(sensor_id)
-        base_ts = "2024-01-01T00:00:00"
         for i, temp in enumerate([33.0, 34.0, 35.0, 36.0, 37.0]):
             cur.execute(
                 "INSERT OR IGNORE INTO measurements (session_id, timestamp, temperature) VALUES (?, ?, ?)",
@@ -243,10 +246,11 @@ class TestIncrementalCalibrationEndpoint:
             )
         conn.commit()
         conn.close()
+        sensor_session = f"{sensor_id}_{session_id}"
 
-        # Kalibrierung #1: Roh 33 → soll 34 sein (delta +1)
+        # Vorschau #1: Roh 33 → soll 34 sein (delta +1). Kein Merge, kein DB-Write.
         res1 = client.post("/calibrate", json={
-            "sensor_session": f"{sensor_id}_{session_id}",
+            "sensor_session": sensor_session,
             "calibration_points": [{"measured": 33.0, "target": 34.0}],
         })
         assert res1.status_code == 200
@@ -254,22 +258,26 @@ class TestIncrementalCalibrationEndpoint:
         assert len(cp1) == 1
         assert abs(cp1[0]["delta"] - 1.0) < 0.01
 
-        # _calibrated Preview nachlesen
-        res_preview = client.get(f"/series/{sensor_id}_{session_id}_calibrated")
+        # Anwenden (persistiert) via POST /calibration
+        client.post("/calibration", json={
+            "sensor_id": sensor_id,
+            "correction_points": json.dumps(cp1),
+        })
+
+        # _calibrated Preview liest den persistenten Stand (delta+1)
+        res_preview = client.get(f"/series/{sensor_session}_calibrated")
         assert res_preview.status_code == 200
         preview_data = res_preview.json()["data"]
         assert len(preview_data) == 5
-        # Bei delta+1: 33→34, 34→35, 35→36, 36→37, 37→38
         temps_after_first = [p["temperature"] for p in preview_data]
         assert abs(temps_after_first[0] - 34.0) < 0.01
         assert abs(temps_after_first[1] - 35.0) < 0.01
         assert abs(temps_after_first[4] - 38.0) < 0.01
-        # NICHT alles auf den gleichen Wert
         assert len(set(temps_after_first)) > 1, f"Erste Kalibrierung mappt alles auf denselben Wert: {temps_after_first}"
 
-        # Kalibrierung #2: Roh 33 → soll 29.9 sein (delta -3.1, ersetzt bestehenden)
+        # Vorschau #2: Roh 33 → soll 29.9 sein (delta -3.1) – Ersetzen, NICHT Akkumulieren
         res2 = client.post("/calibrate", json={
-            "sensor_session": f"{sensor_id}_{session_id}",
+            "sensor_session": sensor_session,
             "calibration_points": [{"measured": 33.0, "target": 29.9}],
         })
         assert res2.status_code == 200
@@ -278,8 +286,14 @@ class TestIncrementalCalibrationEndpoint:
         assert abs(cp2[0]["t"] - 33.0) < 0.01
         assert abs(cp2[0]["delta"] - (-3.1)) < 0.01
 
-        # _calibrated Preview nachlesen – muss variieren, NICHT alles auf 29.9
-        res_preview2 = client.get(f"/series/{sensor_id}_{session_id}_calibrated")
+        # Anwenden (überschreibt die alten Punkte vollständig)
+        client.post("/calibration", json={
+            "sensor_id": sensor_id,
+            "correction_points": json.dumps(cp2),
+        })
+
+        # _calibrated Preview muss den ERSETZTEN Stand zeigen, NICHT alles auf 29.9
+        res_preview2 = client.get(f"/series/{sensor_session}_calibrated")
         assert res_preview2.status_code == 200
         preview_data2 = res_preview2.json()["data"]
         temps_after_second = [p["temperature"] for p in preview_data2]
