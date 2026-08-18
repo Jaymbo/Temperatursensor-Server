@@ -405,34 +405,19 @@ async def calibrate_sensor(request: dict):
         if len(calibration_points) == 0:
             return {"status": "error", "message": "Mindestens ein Kalibrierpunkt erforderlich"}
 
-        from calibration_strategy import apply_correction, interpolation_correction, generate_corrected_preview_data, merge_correction_points
+        from calibration_strategy import apply_correction, interpolation_correction, generate_corrected_preview_data
 
-        # Lade existierende Korrekturpunkte aus der DB
-        sensor_db_id = sensor_session.split('_')[0] if '_' in sensor_session else sensor_session
-        old_correction_points: List[Dict[str, float]] = []
-        existing_cal = get_calibration_points(sensor_db_id)
-        if existing_cal:
-            latest = existing_cal[-1]
-            cp_str = latest.get("correction_points")
-            if cp_str:
-                try:
-                    old_correction_points = json.loads(cp_str)
-                except Exception:
-                    pass
-
-        # Neue Kalibrierpunkte als Rohwert interpretieren (Frontend sendet Rohwert)
+        # Kalibrierungs-Preview: NUR berechnen, NICHTS in der DB speichern.
+        # Die Persistenz erfolgt erst bei "Kalibrierung anwenden" via POST /calibration.
+        # Die gesendeten Punkte bilden die vollständige (kumulative) Punktmenge
+        # und ERSETZEN bestehende Punkte – es wird nicht gemerged/akkumuliert.
         raw_calibration_points = []
         for pt in calibration_points:
             measured = float(pt["measured"])
             target = float(pt["target"])
             raw_calibration_points.append({"t": measured, "delta": target - measured})
 
-        # Merge mit bestehenden Punkten
-        correction_points = merge_correction_points(old_correction_points, raw_calibration_points)
-
-        # Gemergte Korrekturpunkte persistent speichern, damit /series/{session}_calibrated
-        # die vollständige kumulative Korrektur nachlesen kann
-        add_calibration(sensor_db_id, "", json.dumps(correction_points))
+        correction_points = raw_calibration_points
 
         # Preview-Session erstellen und Daten senden
         preview_session_id = f"{sensor_session}_calibrated"

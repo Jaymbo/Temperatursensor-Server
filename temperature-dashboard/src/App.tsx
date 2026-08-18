@@ -36,7 +36,8 @@ function App() {
     console.log("Kalibrierpunkt hinzugefügt:", newPoint);
 
     // NEU: Live-Preview sofort aktualisieren
-    // Sende NUR den neuen Punkt – Backend merget mit bestehenden Punkten aus der DB
+    // Sende ALLE Punkte (kumulativ) – das Backend berechnet daraus die Preview
+    // und überschreibt die bestehende Vorschau (kein Merge, keine DB-Schreibung).
     const originalSession = selected.find(s => !s.endsWith('_calibrated'));
     if (originalSession) {
       try {
@@ -50,10 +51,10 @@ function App() {
           },
           body: JSON.stringify({
             sensor_session: originalSession,
-            calibration_points: [{
-              measured: measuredTemp,
-              target: targetTemp
-            }]
+            calibration_points: updatedPoints.map(p => ({
+              measured: p.measuredTemp,
+              target: p.targetTemp
+            }))
           }),
         });
 
