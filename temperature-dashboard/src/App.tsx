@@ -4,6 +4,7 @@ import { SensorSelector } from "./components/SensorSelector";
 import { useSensorData } from "./hooks/useSensorData";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { buildApiUrl, getApiBase } from "./api";
+import { parseCorrectionPoints, type CorrectionPoint } from "./utils";
 
 const API_BASE = getApiBase();
 
@@ -21,6 +22,9 @@ function App() {
   const [showChangelog, setShowChangelog] = useState<boolean>(false);
   const [updating, setUpdating] = useState<boolean>(false);
   const [version, setVersion] = useState<string>("");
+  const [showCalibParams, setShowCalibParams] = useState<boolean>(false);
+  const [calibParams, setCalibParams] = useState<CorrectionPoint[] | null>(null);
+  const [calibParamsLoading, setCalibParamsLoading] = useState<boolean>(false);
 
   const { sensorSessions, data, comments, isLoading, error, fetchSensorData, updateData, updateComments, deleteComment, addNewSensorSession } = useSensorData();
 
@@ -148,6 +152,35 @@ function App() {
     } catch (error) {
       console.error("Kalibrierungsfehler:", error);
       alert("Fehler bei der finalen Kalibrierung. Siehe Konsole für Details.");
+    }
+  };
+
+  // Bisherige Kalibrierparameter (Korrekturpunkte) aus der DB laden
+  const fetchCalibParams = async () => {
+    const originalSession = selected.find(s => !s.endsWith('_calibrated'));
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    const sensorId = originalSession.split('_')[0];
+    setCalibParamsLoading(true);
+    try {
+      // /calibration erwartet sensor_id als Query-Parameter
+      const res = await fetch(buildApiUrl(`/calibration?sensor_id=${encodeURIComponent(sensorId)}`));
+      if (!res.ok) {
+        throw new Error(`Fehler beim Laden: ${res.statusText}`);
+      }
+      const data = await res.json();
+      // data ist ein Array: [{calibration: ..., correction_points: "..."}]
+      const latest = Array.isArray(data) && data.length > 0 ? data[data.length - 1] : null;
+      const points = parseCorrectionPoints(latest?.correction_points);
+      setCalibParams(points);
+      setShowCalibParams(true);
+    } catch (error) {
+      console.error("Fehler beim Laden der Kalibrierparameter:", error);
+      alert("Fehler beim Laden der Kalibrierparameter. Siehe Konsole für Details.");
+    } finally {
+      setCalibParamsLoading(false);
     }
   };
 
@@ -314,6 +347,21 @@ function App() {
               }}>
                 Kalibrierpunkte: {calibrationPoints.length}
               </div>
+              <button
+                style={{
+                  padding: "1vh 1vw",
+                  fontSize: "3vh",
+                  backgroundColor: "#17a2b8",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "2vh",
+                  cursor: "pointer",
+                }}
+                onClick={fetchCalibParams}
+                disabled={calibParamsLoading}
+              >
+                {calibParamsLoading ? "Lädt..." : "Parameter anzeigen"}
+              </button>
               <button
                 style={{
                   padding: "1vh 1vw",
@@ -691,6 +739,68 @@ function App() {
             <div style={{ display: 'flex', gap: 12, marginTop: 20, justifyContent: 'flex-end' }}>
               <button
                 onClick={() => setShowChangelog(false)}
+                style={{
+                  padding: '8px 16px', fontSize: 14, cursor: 'pointer',
+                  border: '1px solid #ccc', borderRadius: 8, background: '#f8f8f8', color: '#222'
+                }}
+              >
+                Schließen
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dialog: Bisherige Kalibrierparameter anzeigen */}
+      {showCalibParams && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999
+          }}
+          onClick={() => setShowCalibParams(false)}
+        >
+          <div
+            style={{
+              background: '#fff', color: '#222', padding: '24px 28px',
+              borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+              maxWidth: 500, width: '80vw'
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: 12 }}>📋 Bisherige Kalibrierparameter</h3>
+            {calibParams === null ? (
+              <div style={{ color: '#888', fontSize: 15 }}>Keine Daten geladen.</div>
+            ) : calibParams.length === 0 ? (
+              <div style={{ color: '#888', fontSize: 15 }}>
+                Es sind noch keine Korrekturpunkte für diesen Sensor gespeichert.
+              </div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 15 }}>
+                <thead>
+                  <tr style={{ borderBottom: '2px solid #ddd' }}>
+                    <th style={{ textAlign: 'left', padding: '8px' }}>Gemessen (°C)</th>
+                    <th style={{ textAlign: 'left', padding: '8px' }}>Delta (K)</th>
+                    <th style={{ textAlign: 'left', padding: '8px' }}>Soll (°C)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {calibParams.map((pt, i) => (
+                    <tr key={i} style={{ borderBottom: '1px solid #eee' }}>
+                      <td style={{ padding: '8px' }}>{pt.t.toFixed(2)}</td>
+                      <td style={{ padding: '8px' }}>{pt.delta >= 0 ? '+' : ''}{pt.delta.toFixed(2)}</td>
+                      <td style={{ padding: '8px' }}>{(pt.t + pt.delta).toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div style={{ display: 'flex', gap: 12, marginTop: 20, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowCalibParams(false)}
                 style={{
                   padding: '8px 16px', fontSize: 14, cursor: 'pointer',
                   border: '1px solid #ccc', borderRadius: 8, background: '#f8f8f8', color: '#222'
