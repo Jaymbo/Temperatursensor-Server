@@ -6,7 +6,8 @@ from db import (
     add_calibration, add_temperature_data,
     get_start_time_of_latest_session,
     process_relative_data, clone_latest_session_with_calibration,
-    initialize_db, add_or_update_custom_text_entry
+    initialize_db, add_or_update_custom_text_entry,
+    get_time_factor, set_time_factor, get_session_start_time, apply_time_factor
 )
 from update import (
     pull_update, get_current_version, check_setup, check_for_update,
@@ -71,6 +72,126 @@ def get_strategy_description(num_points: int) -> str:
     if num_points == 1:
         return "Globaler Offset"
     return f"Lineare Interpolation ({num_points} Punkte)"
+
+
+def _extract_sensor_id(sensor_session: str) -> str:
+    """
+    Extrahiert die sensor_id aus einer sensor_session ('sensor_id_session_id').
+    Fehlt '_', wird die Session selbst als sensor_id verwendet.
+    """
+    if "_" in sensor_session:
+        return sensor_session.split("_", 1)[0]
+    return sensor_session
+
+
+def apply_time_calibration_to_session(
+    sensor_session: str,
+    data: list,
+    factor: float | None = None,
+) -> list:
+    """
+    Wendet den (persistenten oder uebergebenen) Zeit-Kalibrierungs-Faktor K auf
+    alle Timestamps einer Session an. Temperaturen bleiben unveraendert; nur die
+    Timestamps verschieben sich relativ zum Session-Start (fixer Startpunkt).
+
+    :param sensor_session: 'sensor_id_session_id'
+    :param data: Liste von {timestamp, temperature}
+    :param factor: Explicit Faktor; Default = persistenter Faktor des Sensors
+    :return: Neue Liste mit korrigierten Timestamps (Datenobjekte unveraendert)
+    """
+    if not data:
+        return data
+    if factor is None:
+        factor = get_time_factor(_extract_sensor_id(sensor_session))
+    if factor == 1.0:
+        return data
+    start_time = get_session_start_time(sensor_session)
+    if start_time is None:
+        return data
+    result = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            result.append(entry)
+            continue
+        corrected = dict(entry)
+        if "timestamp" in entry:
+            corrected["timestamp"] = apply_time_factor(
+                entry["timestamp"], start_time, factor
+            )
+        result.append(corrected)
+    return result
+
+
+def generate_time_calibration_preview(
+    sensor_session: str,
+    factor: float,
+) -> dict | None:
+    """
+    Erzeugt korrigierte Messdaten (Timestamps) fuer eine Zeit-Kalibrierungs-Preview.
+
+    Rohdaten aus der DB werden mit dem gegebenen Faktor K relativ zum Session-Start
+    verschoben. Temperaturen bleiben unveraendert.
+
+    :return: {timestamps: [...], temperatures: [...]} oder None
+    """
+    original = get_data_by_sensor(sensor_session)
+    if not original:
+        return None
+    start_time = get_session_start_time(sensor_session)
+    timestamps = []
+    temperatures = []
+    for p in original:
+        if not isinstance(p, dict):
+            continue
+        ts = p.get("timestamp")
+        temp = p.get("temperature")
+        if ts is None or temp is None:
+            continue
+        timestamps.append(apply_time_factor(ts, start_time, factor))
+        temperatures.append(temp)
+    if not timestamps:
+        return None
+    return {"timestamps": timestamps, "temperatures": temperatures}
+
+
+def compute_new_time_factor(
+    current_factor: float,
+    measured_timestamp: str,
+    actual_timestamp: str,
+    start_time: str | None,
+) -> float:
+    """
+    Berechnet den neuen Zeit-Kalibrierungs-Faktor K aus einem Kalibrierpunkt.
+
+    Der Nutzer klickt auf einen *angezeigten* (bereits mit current_factor
+    korrigierten) Punkt `measured` und sagt, dieser soll eigentlich `actual` sein.
+    Der Startpunkt ist fix, daher:
+        K_new = K_old * (actual - start) / (measured - start)
+
+    Dies entspricht kumulativ "bisheriger_Faktor * neuer_Faktor" und vermeidet
+    Rundungsakkumulation, da immer der Abstand zum fixen Start betrachtet wird.
+
+    :param current_factor: Bisheriger Faktor K_old (1.0 falls keine Kalibrierung)
+    :param measured_timestamp: ISO-String des (korrigierten) angezeigten Punkts
+    :param actual_timestamp: ISO-String des vom Nutzer gewuenschten (echten) Punkts
+    :param start_time: ISO-String des Session-Starts
+    :return: Der neue Faktor K_new
+    """
+    if start_time is None:
+        raise ValueError("start_time ist erforderlich, um einen Zeitfaktor zu berechnen.")
+    try:
+        measured = datetime.datetime.fromisoformat(measured_timestamp)
+        actual = datetime.datetime.fromisoformat(actual_timestamp)
+        start = datetime.datetime.fromisoformat(start_time)
+    except (ValueError, TypeError) as e:
+        raise ValueError("Ungueltige ISO-Timestamps.") from e
+
+    measured_offset = (measured - start).total_seconds()
+    actual_offset = (actual - start).total_seconds()
+    if abs(measured_offset) < 1e-9:
+        # Punkt liegt am Start -> Abstand 0, Faktor nicht bestimmbar; alten behalten
+        return current_factor
+    return current_factor * (actual_offset / measured_offset)
 
 
 @app.websocket("/ws")
@@ -147,6 +268,11 @@ def get_series(sensor_session: str):
     data = get_data_by_sensor(sensor_session)
     comments = get_comments_by_sensor(sensor_session)
     print("comments:", comments)  # Debugging-Log
+
+    # Zeit-Kalibrierung: Timestamps relativ zum Session-Start skalieren (fixer Start).
+    # Temperaturen bleiben unveraendert; der Faktor ist pro sensor_id gespeichert.
+    sensor_id = _extract_sensor_id(sensor_session)
+    data = apply_time_calibration_to_session(sensor_session, data, get_time_factor(sensor_id))
     return {"data": data, "comments": comments}
 
 
@@ -284,10 +410,20 @@ async def add_measurements_endpoint(payload: dict):
         # Daten in die Datenbank einfügen
         sensor_session = add_temperature_data(sensor_id, absolute_timestamps, absolute_temperatures)
 
+        # Zeit-Kalibrierung: Timestamps relativ zum Session-Start skalieren (fixer Start).
+        # Rohdaten in der DB bleiben unveraendert; nur die angezeigten Werte werden verschoben.
+        factor = get_time_factor(sensor_id)
+        if factor != 1.0:
+            broadcast_timestamps = [
+                apply_time_factor(ts, start_time, factor) for ts in absolute_timestamps
+            ]
+        else:
+            broadcast_timestamps = absolute_timestamps
+
         # Broadcast-Nachricht senden
         await manager.broadcast(sensor_session, {
             "action": "new_measurements",
-            "timestamps": absolute_timestamps,
+            "timestamps": broadcast_timestamps,
             "temperatures": absolute_temperatures
         })
 
@@ -489,6 +625,139 @@ async def calibrate_sensor(request: dict):
     except Exception as e:
         print(f"Fehler bei der Kalibrierung: {e}")
         return {"status": "error", "message": f"Kalibrierungsfehler: {str(e)}"}
+
+
+@app.post("/calibrate_time")
+async def calibrate_time_sensor(request: dict):
+    """
+    Zeit-Kalibrierungs-Preview (NICHT persistent) basierend auf einem Kalibrierpunkt.
+
+    Erwartet:
+    - sensor_session: str (z.B. "1_15")
+    - measured_timestamp: str (ISO des ANGEZEIGTEN / bereits mit aktuellem Faktor
+      korrigierten Punkts, den der Nutzer geklickt hat)
+    - actual_timestamp: str (ISO des vom Nutzer gewuenschten ECHTEN Zeitpunkts)
+
+    Der Startpunkt der Session ist fix; der Faktor wird aus
+      K_new = K_old * (actual - start) / (measured - start)
+    berechnet (kumulativ; entspricht "bisheriger * neuer Faktor").
+    Die Preview wird ueber WebSocket als '_calibrated'/'_time'-Session gesendet,
+    in der DB wird nichts gespeichert (erst bei /calibrate_time/apply).
+    """
+    try:
+        sensor_session = request.get("sensor_session")
+        measured_ts = request.get("measured_timestamp")
+        actual_ts = request.get("actual_timestamp")
+
+        if not sensor_session or not measured_ts or not actual_ts:
+            return {
+                "status": "error",
+                "message": "sensor_session, measured_timestamp und actual_timestamp sind erforderlich.",
+            }
+
+        sensor_id = _extract_sensor_id(sensor_session)
+        current_factor = get_time_factor(sensor_id)
+        start_time = get_session_start_time(sensor_session)
+        if start_time is None:
+            return {"status": "error", "message": "Keine Session/Startzeit gefunden."}
+
+        new_factor = compute_new_time_factor(
+            current_factor, measured_ts, actual_ts, start_time
+        )
+        if new_factor <= 0:
+            return {"status": "error", "message": "Ungueltiger Zeitfaktor berechnet."}
+
+        corrected = generate_time_calibration_preview(sensor_session, new_factor)
+        preview_session = f"{sensor_session}_calibrated"
+
+        if corrected and len(corrected.get("timestamps", [])) > 0:
+            await manager.broadcast(preview_session, {
+                "action": "new_sensor_session",
+                "sensor_session": preview_session,
+                "custom_text": "⏱ Zeit-Kalibrierung-Vorschau",
+            })
+            await manager.broadcast(preview_session, {
+                "action": "update_measurements",
+                "timestamps": corrected["timestamps"],
+                "temperatures": corrected["temperatures"],
+                "calibration_points": 1,
+                "strategy": "Zeit-Kalibrierung",
+            })
+
+        return {
+            "status": "success",
+            "message": f"Zeit-Kalibrierungs-Preview erstellt (Faktor K={new_factor:.6f}).",
+            "current_factor": current_factor,
+            "new_factor": new_factor,
+            "preview_session": preview_session,
+            "is_preview": True,
+        }
+    except Exception as e:
+        print(f"Fehler bei der Zeit-Kalibrierung: {e}")
+        return {"status": "error", "message": f"Zeit-Kalibrierungsfehler: {str(e)}"}
+
+
+@app.post("/calibrate_time/apply")
+def apply_time_calibration(request: dict):
+    """
+    Speichert den Zeit-Kalibrierungs-Faktor K fuer einen Sensor (persistent).
+
+    Erwartet:
+    - sensor_session: str
+    - measured_timestamp: str (ISO des ANGEZEIGTEN Punkts)
+    - actual_timestamp: str (ISO des gewuenschten ECHTEN Punkts)
+
+    Berechnet K_new = K_old * (actual - start) / (measured - start) und speichert
+    ihn. Rohdaten bleiben unveraendert; beim naechsten Lesezugriff wird K angewandt.
+    """
+    try:
+        sensor_session = request.get("sensor_session")
+        measured_ts = request.get("measured_timestamp")
+        actual_ts = request.get("actual_timestamp")
+
+        if not sensor_session or not measured_ts or not actual_ts:
+            return {
+                "status": "error",
+                "message": "sensor_session, measured_timestamp und actual_timestamp sind erforderlich.",
+            }
+
+        sensor_id = _extract_sensor_id(sensor_session)
+        current_factor = get_time_factor(sensor_id)
+        start_time = get_session_start_time(sensor_session)
+        if start_time is None:
+            return {"status": "error", "message": "Keine Session/Startzeit gefunden."}
+
+        new_factor = compute_new_time_factor(
+            current_factor, measured_ts, actual_ts, start_time
+        )
+        if new_factor <= 0:
+            return {"status": "error", "message": "Ungueltiger Zeitfaktor berechnet."}
+
+        set_time_factor(sensor_id, new_factor)
+        return {
+            "status": "success",
+            "message": f"Zeit-Kalibrierung gespeichert (Faktor K={new_factor:.6f}).",
+            "new_factor": new_factor,
+        }
+    except Exception as e:
+        print(f"Fehler beim Speichern der Zeit-Kalibrierung: {e}")
+        return {"status": "error", "message": f"Zeit-Kalibrierungsfehler: {str(e)}"}
+
+
+@app.get("/time_calibration")
+def get_time_calibration(sensor_id: str):
+    """Gibt den aktuell gespeicherten Zeit-Kalibrierungs-Faktor K eines Sensors zurueck."""
+    return {
+        "sensor_id": sensor_id,
+        "factor": get_time_factor(sensor_id),
+    }
+
+
+@app.delete("/time_calibration")
+def reset_time_calibration(sensor_id: str):
+    """Setzt den Zeit-Kalibrierungs-Faktor K eines Sensors zurueck auf 1.0 (kein Faktor)."""
+    set_time_factor(sensor_id, 1.0)
+    return {"status": "success", "sensor_id": sensor_id, "factor": 1.0}
 
 
 @app.post("/verify_password")

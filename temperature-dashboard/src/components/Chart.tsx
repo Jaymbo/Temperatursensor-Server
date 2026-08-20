@@ -56,18 +56,22 @@ type Props = {
   calibrationMode?: boolean;
   calibrationPoints?: Array<{timestamp: number, measuredTemp: number, targetTemp: number}>;
   onCalibrationPoint?: (timestamp: number, measuredTemp: number, targetTemp: number) => void;
+  timeCalibrationMode?: boolean;
+  onTimeCalibrationPoint?: (timestamp: number, measuredTemp: number) => void;
 };
 
 
 // Zentrale URL Helper wird genutzt (buildApiUrl)
 
-export const Chart: React.FC<Props> = ({ 
-  data, 
-  comments, 
-  kalibriermodus, 
+export const Chart: React.FC<Props> = ({
+  data,
+  comments,
+  kalibriermodus,
   calibrationMode = false,
   calibrationPoints: newCalibrationPoints = [],
-  onCalibrationPoint 
+  onCalibrationPoint,
+  timeCalibrationMode = false,
+  onTimeCalibrationPoint,
 }) => {
   const [commentsState, setComments] = useState(comments);
   const [storedCalibrationPoints, setStoredCalibrationPoints] = useState<{ [sensor_session: string]: { timestamp: string; temperature: number; calibration: string }[] }>({});
@@ -232,6 +236,31 @@ export const Chart: React.FC<Props> = ({
     handleAddCalibrationPoint({ x: chartX, y: chartY });
   }, [storedCalibrationPoints, data]);
 
+  // Zeit-Kalibrierung: Klick auf Datenpunkt -> App fragt die "wirkliche" Zeit.
+  // Ignoriert Kommentare, Kalibrierungspunkte und _calibrated-Kurven (sonst
+  // waere der angezeigte Zeitpunkt mit K_aktuel korrigiert und die Inversion
+  // im Backend nicht mehr konsistent).
+  const handleTimeCalibrationClick = useCallback((event: any) => {
+    if (!onTimeCalibrationPoint) return;
+    const points = event.chart.getElementsAtEventForMode(event.native, "nearest", { intersect: true }, false).reverse();
+    if (points.length === 0) return;
+
+    const point = points[0];
+    const dataset = event.chart.data.datasets[point.datasetIndex];
+    const dataPoint = dataset.data[point.index];
+    const label = dataset.label;
+
+    // Ignoriere Kommentare und Kalibrierungspunkte
+    if (dataPoint.isComment || dataPoint.isCalibrationPoint) return;
+    // Ignoriere _calibrated-Kurven (nur Original/aktuelle Daten sind konsistent)
+    if (label && label.endsWith('_calibrated')) return;
+
+    const timestamp = dataPoint.x; // angezeigter (korrigierter) Zeitpunkt
+    const measuredTemp = dataPoint.y;
+    console.log(`⏱ Zeit-Kalibrierungspunkt: ${new Date(timestamp).toLocaleString()} / ${measuredTemp}°C`);
+    onTimeCalibrationPoint(timestamp, measuredTemp);
+  }, [onTimeCalibrationPoint]);
+
   const handleCommentModeClick = useCallback((event: any) => {
     const points = event.chart.getElementsAtEventForMode(event.native, "nearest", { intersect: true }, false).reverse();
     if (points.length > 0) {
@@ -254,10 +283,12 @@ export const Chart: React.FC<Props> = ({
   }, [commentsState, data]);
 
   const handleChartClick = useCallback((event: any) => {
+    // Zeit-Kalibrierung hat Vorrang (calibrationMode ist in beiden Modi true).
+    if (timeCalibrationMode) return handleTimeCalibrationClick(event);
     if (calibrationMode) return handleNewCalibrationClick(event);
     if (kalibriermodus) return handleOldCalibrationClick(event);
     return handleCommentModeClick(event);
-  }, [calibrationMode, kalibriermodus, handleNewCalibrationClick, handleOldCalibrationClick, handleCommentModeClick]);
+  }, [timeCalibrationMode, calibrationMode, kalibriermodus, handleTimeCalibrationClick, handleNewCalibrationClick, handleOldCalibrationClick, handleCommentModeClick]);
 
   const handleAddComment = ({ x, y }: { x: number; y: number }) => {
     const sensorSession = getSingleSensorSession();
@@ -533,15 +564,17 @@ export const Chart: React.FC<Props> = ({
     plugins: {
       title: {
         display: true,
-        text: calibrationMode 
-          ? "NEUER KALIBRIERUNGSMODUS - Klicken Sie auf Datenpunkte um Kalibrierungspunkte zu setzen" 
-          : kalibriermodus 
-            ? "ALTER KALIBRIERUNGSMODUS - Klicken zum Hinzufügen von Kalibrierpunkten"
-            : "Klicken Sie auf Datenpunkte um Kommentare hinzuzufügen",
-        color: calibrationMode ? "red" : kalibriermodus ? "orange" : "#666",
-        font: { 
-          size: (calibrationMode || kalibriermodus) ? 16 : 14, 
-          weight: (calibrationMode || kalibriermodus) ? "bold" as const : "normal" as const 
+        text: timeCalibrationMode
+          ? "ZEIT-KALIBRIERUNG - Klicken Sie auf einen Punkt und geben Sie die korrekte Zeit ein"
+          : calibrationMode
+            ? "NEUER KALIBRIERUNGSMODUS - Klicken Sie auf Datenpunkte um Kalibrierungspunkte zu setzen"
+            : kalibriermodus
+              ? "ALTER KALIBRIERUNGSMODUS - Klicken zum Hinzufügen von Kalibrierpunkten"
+              : "Klicken Sie auf Datenpunkte um Kommentare hinzuzufügen",
+        color: timeCalibrationMode ? "#0c5460" : calibrationMode ? "red" : kalibriermodus ? "orange" : "#666",
+        font: {
+          size: (timeCalibrationMode || calibrationMode || kalibriermodus) ? 16 : 14,
+          weight: (timeCalibrationMode || calibrationMode || kalibriermodus) ? "bold" as const : "normal" as const
         }
       },
       zoom: {
