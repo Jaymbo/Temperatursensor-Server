@@ -25,6 +25,8 @@ function App() {
   const [showCalibParams, setShowCalibParams] = useState<boolean>(false);
   const [calibParams, setCalibParams] = useState<CorrectionPoint[] | null>(null);
   const [calibParamsLoading, setCalibParamsLoading] = useState<boolean>(false);
+  // Modal zur Wahl der Kalibrierungsart (Temperatur/Zeit) statt window.confirm.
+  const [showCalibrationType, setShowCalibrationType] = useState<boolean>(false);
 
   // Zeit-Kalibrierung (neben Temperatur-Kalibrierung)
   // "none" | "temperature" | "time" beschreibt die aktive Kalibrier-Modalität.
@@ -195,6 +197,16 @@ function App() {
 
   // Original-Session (ohne _calibrated) aus der aktuellen Auswahl bestimmen.
   const getOriginalSession = () => selected.find(s => !s.endsWith('_calibrated'));
+
+  // Kalibrierungsmodus in der gewaehlten Art (Temperatur/Zeit) starten.
+  const startCalibration = (type: "temperature" | "time") => {
+    setCalibrationMode(true);
+    setCalibrationType(type);
+    setCalibrationPoints([]);
+    setTimeCalibrationPoint(null);
+    setShowTimeInput(false);
+    setShowCalibrationType(false);
+  };
 
   // Zeit-Kalibrierung: geklickter Punkt -> Zeit-Eingabe-Modal oeffnen.
   const handleTimeCalibrationPoint = (timestamp: number, measuredTemp: number) => {
@@ -613,23 +625,8 @@ function App() {
                   alert("Falsches Passwort!");
                   return;
                 }
-                // Nach der Freischaltung: Art der Kalibrierung waehlen.
-                // OK = Temperatur (wie bisher), Abbrechen = Zeit.
-                const isTemperature = window.confirm(
-                  "Art der Kalibrierung waehlen:\n\n[OK] = TEMPERATUR (wie bisher)\n[Abbrechen] = ZEIT (Uhr-Abweichung)"
-                );
-                if (!isTemperature) {
-                  // Zeit-Kalibrierung
-                  setCalibrationMode(true);
-                  setCalibrationType("time");
-                  setCalibrationPoints([]);
-                  setTimeCalibrationPoint(null);
-                  setShowTimeInput(false);
-                } else {
-                  setCalibrationMode(true);
-                  setCalibrationType("temperature");
-                  setCalibrationPoints([]);
-                }
+                // Nach der Freischaltung: Art der Kalibrierung waehlen (Modal mit zwei Buttons).
+                setShowCalibrationType(true);
               }
             }}
           >
@@ -1071,6 +1068,60 @@ function App() {
                 Vorschau
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dialog: Art der Kalibrierung waehlen (Temperatur/Zeit) */}
+      {showCalibrationType && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999
+          }}
+          onClick={() => setShowCalibrationType(false)}
+        >
+          <div
+            style={{
+              background: '#fff', color: '#222', padding: '24px 28px',
+              borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+              minWidth: 400
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: 8 }}>🔧 Art der Kalibrierung</h3>
+            <p style={{ margin: '0 0 18px', fontSize: 14, color: '#555' }}>
+              Bitte wahlen, welche Kalibrierung durchgefuehrt werden soll.
+            </p>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => startCalibration("temperature")}
+                style={{
+                  padding: '10px 18px', fontSize: 14, cursor: 'pointer',
+                  border: 'none', borderRadius: 8, background: '#17a2b8', color: 'white',
+                  fontWeight: 'bold'
+                }}
+              >
+                🌡 Temperatur
+              </button>
+              <button
+                onClick={() => startCalibration("time")}
+                style={{
+                  padding: '10px 18px', fontSize: 14, cursor: 'pointer',
+                  border: 'none', borderRadius: 8, background: '#6f42c1', color: 'white',
+                  fontWeight: 'bold'
+                }}
+              >
+                ⏱ Zeit
+              </button>
+            </div>
+            <p style={{ margin: '16px 0 0', fontSize: 12, color: '#888' }}>
+              <strong>Temperatur:</strong> Punkte setzen → „Kalibrierung anwenden“.<br />
+              <strong>Zeit:</strong> Punkt auf Kurve klicken → korrekte Uhrzeit eingeben → „Vorschau“ → „Anwenden“.
+            </p>
           </div>
         </div>
       )}
