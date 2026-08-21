@@ -4,7 +4,7 @@ import { SensorSelector } from "./components/SensorSelector";
 import { useSensorData } from "./hooks/useSensorData";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { buildApiUrl, getApiBase } from "./api";
-import { parseCorrectionPoints, type CorrectionPoint } from "./utils";
+import { parseCorrectionPoints, type CorrectionPoint, localIso, buildActualTimestamp } from "./utils";
 
 const API_BASE = getApiBase();
 
@@ -25,6 +25,18 @@ function App() {
   const [showCalibParams, setShowCalibParams] = useState<boolean>(false);
   const [calibParams, setCalibParams] = useState<CorrectionPoint[] | null>(null);
   const [calibParamsLoading, setCalibParamsLoading] = useState<boolean>(false);
+  // Zeit-Kalibrierungsfaktor K (zum Anzeigen/Zurücksetzen im Parameter-Dialog).
+  const [timeFactor, setTimeFactor] = useState<number | null>(null);
+  // Modal zur Wahl der Kalibrierungsart (Temperatur/Zeit) statt window.confirm.
+  const [showCalibrationType, setShowCalibrationType] = useState<boolean>(false);
+
+  // Zeit-Kalibrierung (neben Temperatur-Kalibrierung)
+  // "none" | "temperature" | "time" beschreibt die aktive Kalibrier-Modalität.
+  const [calibrationType, setCalibrationType] = useState<"none" | "temperature" | "time">("none");
+  // Geklickter Zeit-Kalibrierpunkt (angezeigter/gemessener Zeitpunkt).
+  const [timeCalibrationPoint, setTimeCalibrationPoint] = useState<{ timestamp: number; measuredTemp: number } | null>(null);
+  const [showTimeInput, setShowTimeInput] = useState<boolean>(false);
+  const [timeInput, setTimeInput] = useState<string>("");
 
   const { sensorSessions, data, comments, isLoading, error, fetchSensorData, updateData, updateComments, deleteComment, addNewSensorSession } = useSensorData();
 
@@ -176,12 +188,212 @@ function App() {
       const latest = Array.isArray(data) && data.length > 0 ? data[data.length - 1] : null;
       const points = parseCorrectionPoints(latest?.correction_points);
       setCalibParams(points);
+      // Zeit-Kalibrierungsfaktor K laden (falls vorhanden), sonst null (K=1.0).
+      try {
+        const tRes = await fetch(buildApiUrl(`/time_calibration?sensor_id=${encodeURIComponent(sensorId)}`));
+        if (tRes.ok) {
+          const tData = await tRes.json();
+          // Faktor 1.0 bedeutet "keine Korrektur" -> null anzeigen.
+          setTimeFactor(
+            typeof tData?.factor === "number" && tData.factor !== 1.0
+              ? tData.factor
+              : null
+          );
+        } else {
+          setTimeFactor(null);
+        }
+      } catch {
+        setTimeFactor(null);
+      }
       setShowCalibParams(true);
     } catch (error) {
       console.error("Fehler beim Laden der Kalibrierparameter:", error);
       alert("Fehler beim Laden der Kalibrierparameter. Siehe Konsole für Details.");
     } finally {
       setCalibParamsLoading(false);
+    }
+  };
+
+  // Temperatur-Kalibrierung: einen Korrekturpunkt aus der DB entfernen und neu speichern.
+  const deleteCalibrationPoint = async (index: number) => {
+    const originalSession = getOriginalSession();
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    if (!calibParams) return;
+    if (!confirm(`Korrekturpunkt Nr. ${index + 1} (gemessen ${calibParams[index].t.toFixed(2)} °C) löschen?`)) {
+      return;
+    }
+    const sensorId = originalSession.split('_')[0];
+    try {
+      const remaining = calibParams.filter((_, i) => i !== index);
+      const res = await fetch(buildApiUrl('/calibration'), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sensor_id: sensorId,
+          correction_points: JSON.stringify(remaining),
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Fehler beim Löschen: ${res.statusText}`);
+      }
+      setCalibParams(remaining);
+      fetchSensorData(selected.filter(s => !s.endsWith('_calibrated')));
+      alert("Korrekturpunkt gelöscht.");
+    } catch (error) {
+      console.error("Fehler beim Löschen des Korrekturpunkts:", error);
+      alert("Fehler beim Löschen des Korrekturpunkts. Siehe Konsole für Details.");
+    }
+  };
+
+  // Zeit-Kalibrierung: Faktor K auf 1.0 (kein Faktor) zuruecksetzen.
+  const resetTimeFactor = async () => {
+    const originalSession = getOriginalSession();
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    if (!confirm("Zeit-Kalibrierung zuruecksetzen (Faktor K auf 1.0)?")) {
+      return;
+    }
+    const sensorId = originalSession.split('_')[0];
+    try {
+      const res = await fetch(buildApiUrl(`/time_calibration?sensor_id=${encodeURIComponent(sensorId)}`), {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        throw new Error(`Fehler beim Zuruecksetzen: ${res.statusText}`);
+      }
+      setTimeFactor(null);
+      fetchSensorData(selected.filter(s => !s.endsWith('_calibrated')));
+      alert("Zeit-Kalibrierung zurueckgesetzt (K=1.0).");
+    } catch (error) {
+      console.error("Fehler beim Zuruecksetzen der Zeit-Kalibrierung:", error);
+      alert("Fehler beim Zuruecksetzen der Zeit-Kalibrierung. Siehe Konsole für Details.");
+    }
+  };
+
+  // Original-Session (ohne _calibrated) aus der aktuellen Auswahl bestimmen.
+  const getOriginalSession = () => selected.find(s => !s.endsWith('_calibrated'));
+
+  // Kalibrierungsmodus in der gewaehlten Art (Temperatur/Zeit) starten.
+  const startCalibration = (type: "temperature" | "time") => {
+    setCalibrationMode(true);
+    setCalibrationType(type);
+    setCalibrationPoints([]);
+    setTimeCalibrationPoint(null);
+    setShowTimeInput(false);
+    setShowCalibrationType(false);
+  };
+
+  // Kalibrierungsmodus beenden und alle temporären Kalibrier-Zustände aufraeumen.
+  const cancelCalibration = () => {
+    setCalibrationMode(false);
+    setCalibrationType("none");
+    setCalibrationPoints([]);
+    setTimeCalibrationPoint(null);
+    setShowTimeInput(false);
+    // Entferne Preview-Sessions aus Auswahl.
+    setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
+  };
+
+  // Zeit-Kalibrierung: geklickter Punkt -> Zeit-Eingabe-Modal oeffnen.
+  const handleTimeCalibrationPoint = (timestamp: number, measuredTemp: number) => {
+    setTimeCalibrationPoint({ timestamp, measuredTemp });
+    // Default: Uhrzeit des geklickten (angezeigten) Punkts vorausfuellen.
+    const d = new Date(timestamp);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    setTimeInput(`${pad(d.getHours())}:${pad(d.getMinutes())}`);
+    setShowTimeInput(true);
+  };
+
+  // Zeit-Kalibrierung: Preview (nicht persistent) senden.
+  const submitTimeCalibration = async () => {
+    if (!timeCalibrationPoint) return;
+    const originalSession = getOriginalSession();
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    const measured = new Date(timeCalibrationPoint.timestamp);
+    const actual = buildActualTimestamp(measured, timeInput);
+    if (!actual) {
+      alert("Bitte eine gueltige Zeit im Format HH:mm (oder HH:mm:ss) eingeben!");
+      return;
+    }
+    try {
+      const res = await fetch(buildApiUrl('/calibrate_time'), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sensor_session: originalSession,
+          measured_timestamp: localIso(measured),
+          actual_timestamp: localIso(actual),
+        }),
+      });
+      const result = await res.json();
+      if (!res.ok || result.status === "error") {
+        alert(result.message || "Fehler bei der Zeit-Kalibrierung-Vorschau.");
+        return;
+      }
+      // Preview-Session (falls noch nicht) in Auswahl aufnehmen, damit sie angezeigt wird.
+      const previewSession = `${originalSession}_calibrated`;
+      if (!selected.includes(previewSession)) {
+        setSelected(prev => [...prev, previewSession]);
+      }
+      console.log(`✅ Zeit-Kalibrierungs-Preview: ${result.message}`);
+    } catch (err) {
+      console.error("Zeit-Kalibrierungs-Preview Fehler:", err);
+      alert("Fehler bei der Zeit-Kalibrierung-Vorschau. Siehe Konsole.");
+    }
+  };
+
+  // Zeit-Kalibrierung: final speichern (persistiert Faktor).
+  const performTimeCalibration = async () => {
+    if (!timeCalibrationPoint) {
+      alert("Bitte zuerst einen Punkt anklicken und eine Zeit eingeben!");
+      return;
+    }
+    const originalSession = getOriginalSession();
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    const measured = new Date(timeCalibrationPoint.timestamp);
+    const actual = buildActualTimestamp(measured, timeInput);
+    if (!actual) {
+      alert("Bitte eine gueltige Zeit im Format HH:mm (oder HH:mm:ss) eingeben!");
+      return;
+    }
+    try {
+      const res = await fetch(buildApiUrl('/calibrate_time/apply'), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sensor_session: originalSession,
+          measured_timestamp: localIso(measured),
+          actual_timestamp: localIso(actual),
+        }),
+      });
+      const result = await res.json();
+      if (!res.ok || result.status === "error") {
+        alert(result.message || "Fehler beim Speichern der Zeit-Kalibrierung.");
+        return;
+      }
+      // Kalibriermodus beenden, Zeit-Punkt und Preview aufraeumen.
+      setCalibrationMode(false);
+      setCalibrationType("none");
+      setTimeCalibrationPoint(null);
+      setShowTimeInput(false);
+      setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
+      // Daten neu laden, damit der (jetzt persistent angewandte) Faktor sofort sichtbar ist.
+      fetchSensorData(selected.filter(s => !s.endsWith('_calibrated')));
+      alert(result.message || "Zeit-Kalibrierung gespeichert!");
+    } catch (err) {
+      console.error("Zeit-Kalibrierung (Apply) Fehler:", err);
+      alert("Fehler beim Speichern der Zeit-Kalibrierung. Siehe Konsole.");
     }
   };
 
@@ -336,7 +548,7 @@ function App() {
       </header>
       <div style={{ position: "absolute", top: "1vh", right: "1vw", zIndex: 1 }}>
         <div style={{ display: "flex", gap: "1vw", alignItems: "center" }}>
-          {calibrationMode && (
+          {calibrationMode && calibrationType === "temperature" && (
             <>
               <div style={{ 
                 padding: "0.5vh 1vw", 
@@ -388,12 +600,67 @@ function App() {
                   borderRadius: "2vh",
                   cursor: "pointer",
                 }}
-                onClick={() => {
-                  setCalibrationMode(false);
-                  setCalibrationPoints([]);
-                  // Entferne Preview-Sessions aus Auswahl
-                  setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
+                onClick={cancelCalibration}
+              >
+                Abbrechen
+              </button>
+            </>
+          )}
+          {calibrationMode && calibrationType === "time" && (
+            <>
+              <div style={{
+                padding: "0.5vh 1vw",
+                backgroundColor: "#d1ecf1",
+                border: "1px solid #b0d7e8",
+                borderRadius: "1vh",
+                fontSize: "2vh",
+                color: "#0c5460"
+              }}>
+                {timeCalibrationPoint
+                  ? `Punkt: ${new Date(timeCalibrationPoint.timestamp).toLocaleString()}`
+                  : "Punkt auf Kurve klicken..."}
+              </div>
+              <button
+                style={{
+                  padding: "1vh 1vw",
+                  fontSize: "3vh",
+                  backgroundColor: "#17a2b8",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "2vh",
+                  cursor: "pointer",
                 }}
+                onClick={fetchCalibParams}
+                disabled={calibParamsLoading}
+              >
+                {calibParamsLoading ? "Lädt..." : "Parameter anzeigen"}
+              </button>
+              <button
+                style={{
+                  padding: "1vh 1vw",
+                  fontSize: "3vh",
+                  backgroundColor: "#28a745",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "2vh",
+                  cursor: "pointer",
+                }}
+                onClick={performTimeCalibration}
+                disabled={!timeCalibrationPoint}
+              >
+                Anwenden
+              </button>
+              <button
+                style={{
+                  padding: "1vh 1vw",
+                  fontSize: "3vh",
+                  backgroundColor: "#6c757d",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "2vh",
+                  cursor: "pointer",
+                }}
+                onClick={cancelCalibration}
               >
                 Abbrechen
               </button>
@@ -411,9 +678,7 @@ function App() {
             }}
             onClick={async () => {
               if (calibrationMode) {
-                setCalibrationMode(false);
-                setCalibrationPoints([]);
-                setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
+                cancelCalibration();
               } else {
                 if (!selected.some(s => !s.endsWith('_calibrated'))) {
                   alert("Bitte mindestens eine Original-Sensor-Session für die Kalibrierung auswählen!");
@@ -435,8 +700,8 @@ function App() {
                   alert("Falsches Passwort!");
                   return;
                 }
-                setCalibrationMode(true);
-                setCalibrationPoints([]);
+                // Nach der Freischaltung: Art der Kalibrierung waehlen (Modal mit zwei Buttons).
+                setShowCalibrationType(true);
               }
             }}
           >
@@ -476,12 +741,14 @@ function App() {
           {isLoading && <div>Loading...</div>}
           {error && <div style={{ color: "red" }}>{error}</div>}
           {selected.length > 0 && (
-            <Chart 
-              data={data} 
-              comments={comments} 
+            <Chart
+              data={data}
+              comments={comments}
               calibrationMode={calibrationMode}
               calibrationPoints={calibrationPoints}
               onCalibrationPoint={addCalibrationPoint}
+              timeCalibrationMode={calibrationType === "time"}
+              onTimeCalibrationPoint={handleTimeCalibrationPoint}
             />
           )}
         </div>
@@ -626,7 +893,9 @@ function App() {
                 <li><strong>Drag</strong>: Verschieben (Pan)</li>
                 <li><strong>Strg halten</strong>: Vertikal statt horizontal zoomen</li>
                 <li><strong>Klick auf Datenpunkt</strong>: Kommentar hinzufügen</li>
-                <li><strong>Kalibrierungsmodus</strong>: Button oben rechts → Passwort „Admin-Passwort“ → Kalibrierpunkte setzen (max. 2) → „Kalibrierung anwenden“</li>
+                <li><strong>Kalibrierungsmodus</strong>: Button oben rechts → Passwort „Admin-Passwort“ → Auswahl „Temperatur/Zeit“</li>
+                <li><strong>Temperatur-Kalibrierung</strong>: Kalibrierpunkte setzen (max. 2) → „Kalibrierung anwenden“</li>
+                <li><strong>Zeit-Kalibrierung</strong>: Punkt auf Kurve klicken → korrekte Uhrzeit eingeben → „Vorschau“ → „Anwenden“ (korrigiert die Uhr-Abweichung des ESP8266)</li>
                 <li><strong>Live-Preview</strong>: Wird als <code>_calibrated</code>-Serie angezeigt</li>
               </ul>
               <p>
@@ -772,8 +1041,32 @@ function App() {
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 style={{ marginTop: 0, marginBottom: 12 }}>📋 Bisherige Kalibrierparameter</h3>
-            {calibParams === null ? (
+            <h3 style={{ marginTop: 0, marginBottom: 12 }}>
+              {calibrationType === "time" ? "⏱ Zeit-Kalibrierparameter" : "🌡 Temperatur-Kalibrierparameter"}
+            </h3>
+            {calibrationType === "time" ? (
+              <div style={{ fontSize: 15 }}>
+                <p style={{ margin: '0 0 12px', color: '#555' }}>
+                  Zeit-Kalibrierungsfaktor <strong>K</strong>:
+                </p>
+                <div style={{ fontSize: 22, fontFamily: 'monospace', marginBottom: 8 }}>
+                  {timeFactor === null ? "1.00 (keine Korrektur)" : timeFactor.toFixed(4)}
+                </div>
+                <p style={{ margin: '0 0 16px', fontSize: 12, color: '#888' }}>
+                  Der Startpunkt bleibt fix; alle weiteren Punkte verschieben sich
+                  entsprechend dem Faktor.
+                </p>
+                <button
+                  onClick={resetTimeFactor}
+                  style={{
+                    padding: '8px 16px', fontSize: 14, cursor: 'pointer',
+                    border: 'none', borderRadius: 8, background: '#dc3545', color: 'white'
+                  }}
+                >
+                  🗑 Faktor zurücksetzen (K=1.0)
+                </button>
+              </div>
+            ) : calibParams === null ? (
               <div style={{ color: '#888', fontSize: 15 }}>Keine Daten geladen.</div>
             ) : calibParams.length === 0 ? (
               <div style={{ color: '#888', fontSize: 15 }}>
@@ -786,6 +1079,9 @@ function App() {
                     <th style={{ textAlign: 'left', padding: '8px' }}>Gemessen (°C)</th>
                     <th style={{ textAlign: 'left', padding: '8px' }}>Delta (K)</th>
                     <th style={{ textAlign: 'left', padding: '8px' }}>Soll (°C)</th>
+                    <th style={{ textAlign: 'right', padding: '8px' }}>
+                      <span title="Korrekturpunkt löschen">🗑</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -794,6 +1090,18 @@ function App() {
                       <td style={{ padding: '8px' }}>{pt.t.toFixed(2)}</td>
                       <td style={{ padding: '8px' }}>{pt.delta >= 0 ? '+' : ''}{pt.delta.toFixed(2)}</td>
                       <td style={{ padding: '8px' }}>{(pt.t + pt.delta).toFixed(2)}</td>
+                      <td style={{ padding: '8px', textAlign: 'right' }}>
+                        <button
+                          onClick={() => deleteCalibrationPoint(i)}
+                          title={`Korrekturpunkt Nr. ${i + 1} löschen`}
+                          style={{
+                            padding: '4px 8px', fontSize: 13, cursor: 'pointer',
+                            border: '1px solid #ccc', borderRadius: 6, background: '#f8f8f8', color: '#222'
+                          }}
+                        >
+                          🗑
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -810,6 +1118,124 @@ function App() {
                 Schließen
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dialog: Zeit-Kalibrierung – korrekte Zeit eingeben */}
+      {showTimeInput && timeCalibrationPoint && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999
+          }}
+          onClick={() => setShowTimeInput(false)}
+        >
+          <div
+            style={{
+              background: '#fff', color: '#222', padding: '24px 28px',
+              borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+              minWidth: 380
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: 8 }}>⏱ Zeit-Kalibrierung</h3>
+            <p style={{ margin: '0 0 12px', fontSize: 14, color: '#555' }}>
+              Angezeigter Zeitpunkt des geklickten Punkts:<br />
+              <strong>{new Date(timeCalibrationPoint.timestamp).toLocaleString()}</strong>
+            </p>
+            <label style={{ display: 'block', marginBottom: 16 }}>
+              Die korrekte Uhrzeit (HH:mm oder HH:mm:ss):
+              <input
+                type="text"
+                value={timeInput}
+                onChange={(e) => setTimeInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') submitTimeCalibration(); }}
+                style={{ width: '100%', padding: '8px 10px', marginTop: 6, fontSize: 16, boxSizing: 'border-box' }}
+                placeholder="z.B. 08:35"
+              />
+            </label>
+            <p style={{ margin: '0 0 16px', fontSize: 12, color: '#888' }}>
+              Datum bleibt gleich – nur die Uhrzeit wird korrigiert. Der Startpunkt
+              bleibt fix; alle weiteren Punkte verschieben sich entsprechend.
+            </p>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setShowTimeInput(false)}
+                style={{
+                  padding: '8px 16px', fontSize: 14, cursor: 'pointer',
+                  border: '1px solid #ccc', borderRadius: 8, background: '#f8f8f8', color: '#222'
+                }}
+              >
+                Abbrechen
+              </button>
+              <button
+                onClick={submitTimeCalibration}
+                style={{
+                  padding: '8px 16px', fontSize: 14, cursor: 'pointer',
+                  border: 'none', borderRadius: 8, background: '#17a2b8', color: 'white'
+                }}
+              >
+                Vorschau
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Dialog: Art der Kalibrierung waehlen (Temperatur/Zeit) */}
+      {showCalibrationType && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999
+          }}
+          onClick={() => setShowCalibrationType(false)}
+        >
+          <div
+            style={{
+              background: '#fff', color: '#222', padding: '24px 28px',
+              borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+              minWidth: 400
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, marginBottom: 8 }}>🔧 Art der Kalibrierung</h3>
+            <p style={{ margin: '0 0 18px', fontSize: 14, color: '#555' }}>
+              Bitte wahlen, welche Kalibrierung durchgefuehrt werden soll.
+            </p>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => startCalibration("temperature")}
+                style={{
+                  padding: '10px 18px', fontSize: 14, cursor: 'pointer',
+                  border: 'none', borderRadius: 8, background: '#17a2b8', color: 'white',
+                  fontWeight: 'bold'
+                }}
+              >
+                🌡 Temperatur
+              </button>
+              <button
+                onClick={() => startCalibration("time")}
+                style={{
+                  padding: '10px 18px', fontSize: 14, cursor: 'pointer',
+                  border: 'none', borderRadius: 8, background: '#6f42c1', color: 'white',
+                  fontWeight: 'bold'
+                }}
+              >
+                ⏱ Zeit
+              </button>
+            </div>
+            <p style={{ margin: '16px 0 0', fontSize: 12, color: '#888' }}>
+              <strong>Temperatur:</strong> Punkte setzen → „Kalibrierung anwenden“.<br />
+              <strong>Zeit:</strong> Punkt auf Kurve klicken → korrekte Uhrzeit eingeben → „Vorschau“ → „Anwenden“.
+            </p>
           </div>
         </div>
       )}

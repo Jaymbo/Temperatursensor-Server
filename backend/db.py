@@ -1,5 +1,6 @@
 import sqlite3
 import datetime
+import math
 import os
 
 # Use a DB file located next to this module to avoid cwd-dependent paths
@@ -51,6 +52,20 @@ def initialize_db():
             timestamp TIMESTAMP NOT NULL,
             temperature REAL NOT NULL,
             comment TEXT NOT NULL
+        )
+        """
+    )
+
+    # Tabelle 'time_calibration' (Zeit-Kalibrierung pro Sensor)
+    # Speichert einen Faktor K pro sensor_id, der beim Anzeigen der Daten auf die
+    # Timestamps relativ zum Session-Start angewendet wird. Die Rohdaten in
+    # 'measurements' bleiben unveraendert (K kann so jederzeit rechnerisch revidiert
+    # werden). Siehe db.apply_time_factor.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS time_calibration (
+            sensor_id TEXT PRIMARY KEY,
+            factor REAL NOT NULL DEFAULT 1.0
         )
         """
     )
@@ -406,6 +421,93 @@ def clone_latest_session_with_calibration(sensor_id: str, messintervall: float =
         }
     finally:
         conn.close()
+
+def get_time_factor(sensor_id: str) -> float:
+    """
+    Gibt den gespeicherten Zeit-Kalibrierungs-Faktor K fuer eine sensor_id zurueck.
+
+    K = 1.0 bedeutet "keine Korrektur". K > 1 streckt die Zeit (Uhr lief zu langsam),
+    K < 1 staucht die Zeit (Uhr lief zu schnell). Fehlt noch keine Kalibrierung,
+    wird 1.0 zurueckgegeben.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT factor FROM time_calibration WHERE sensor_id = ?", (sensor_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return 1.0
+    return float(row[0]) if row[0] is not None else 1.0
+
+
+def set_time_factor(sensor_id: str, factor: float) -> None:
+    """
+    Speichert (oder ueberschreibt) den Zeit-Kalibrierungs-Faktor K fuer eine sensor_id.
+    """
+    if not sensor_id:
+        raise ValueError("sensor_id darf nicht leer sein.")
+    if not (isinstance(factor, (int, float)) and factor > 0.0 and math.isfinite(float(factor))):
+        raise ValueError("factor muss eine positive, endliche Zahl sein.")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO time_calibration (sensor_id, factor) VALUES (?, ?)",
+        (sensor_id, float(factor)),
+    )
+    conn.commit()
+    conn.close()
+    print(f"Zeit-Kalibrierungsfaktor fuer Sensor {sensor_id} aktualisiert: {factor}")
+
+
+def get_session_start_time(sensor_session: str) -> str | None:
+    """
+    Gibt den Startzeitpunkt (ISO-String) einer bestimmten sensor_session zurueck
+    oder None, falls die Session nicht existiert.
+
+    Erwartet sensor_session im Format 'sensor_id_session_id'.
+    """
+    try:
+        sensor_id, session_id = sensor_session.split("_")
+    except ValueError:
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT start_time FROM sessions WHERE id = ? AND sensor_id = ?",
+        (session_id, sensor_id),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def apply_time_factor(timestamp: str, start_time: str | None, factor: float) -> str:
+    """
+    Wendet den Zeit-Kalibrierungs-Faktor K auf einen absoluten Timestamp an.
+
+    Berechnung (fixer Startpunkt):
+        korrigiert = start + (gemessen - start) * K
+
+    Damit bleibt der Session-Start immer exakt unveraendert und nur der Abstand
+    zum Start wird gestreckt (K>1) bzw. gestaucht (K<1).
+
+    :param timestamp: ISO-String des gemessenen (gespeicherten) Zeitpunkts
+    :param start_time: ISO-String des Session-Starts (Kann None sein -> kein Faktor)
+    :param factor: Der Kalibrierungs-Faktor K (1.0 = keine Korrektur)
+    :return: ISO-String des korrigierten Zeitpunkts (bei Fehler -> Original)
+    """
+    if factor == 1.0 or start_time is None or timestamp is None:
+        return timestamp
+    try:
+        ts = datetime.datetime.fromisoformat(timestamp)
+        start = datetime.datetime.fromisoformat(start_time)
+    except (ValueError, TypeError):
+        return timestamp
+    # Nur den Abstand zum Start skalieren -> Startpunkt bleibt fix
+    delta = ts - start
+    corrected = start + delta * factor
+    return corrected.isoformat()
+
 
 def add_or_update_custom_text_entry(custom_text: str, messintervall: float = 10.0, sendpuffer: int = 60):
     """
