@@ -25,6 +25,8 @@ function App() {
   const [showCalibParams, setShowCalibParams] = useState<boolean>(false);
   const [calibParams, setCalibParams] = useState<CorrectionPoint[] | null>(null);
   const [calibParamsLoading, setCalibParamsLoading] = useState<boolean>(false);
+  // Zeit-Kalibrierungsfaktor K (zum Anzeigen/Zurücksetzen im Parameter-Dialog).
+  const [timeFactor, setTimeFactor] = useState<number | null>(null);
   // Modal zur Wahl der Kalibrierungsart (Temperatur/Zeit) statt window.confirm.
   const [showCalibrationType, setShowCalibrationType] = useState<boolean>(false);
 
@@ -186,12 +188,90 @@ function App() {
       const latest = Array.isArray(data) && data.length > 0 ? data[data.length - 1] : null;
       const points = parseCorrectionPoints(latest?.correction_points);
       setCalibParams(points);
+      // Zeit-Kalibrierungsfaktor K laden (falls vorhanden), sonst null (K=1.0).
+      try {
+        const tRes = await fetch(buildApiUrl(`/time_calibration?sensor_id=${encodeURIComponent(sensorId)}`));
+        if (tRes.ok) {
+          const tData = await tRes.json();
+          // Faktor 1.0 bedeutet "keine Korrektur" -> null anzeigen.
+          setTimeFactor(
+            typeof tData?.factor === "number" && tData.factor !== 1.0
+              ? tData.factor
+              : null
+          );
+        } else {
+          setTimeFactor(null);
+        }
+      } catch {
+        setTimeFactor(null);
+      }
       setShowCalibParams(true);
     } catch (error) {
       console.error("Fehler beim Laden der Kalibrierparameter:", error);
       alert("Fehler beim Laden der Kalibrierparameter. Siehe Konsole für Details.");
     } finally {
       setCalibParamsLoading(false);
+    }
+  };
+
+  // Temperatur-Kalibrierung: einen Korrekturpunkt aus der DB entfernen und neu speichern.
+  const deleteCalibrationPoint = async (index: number) => {
+    const originalSession = getOriginalSession();
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    if (!calibParams) return;
+    if (!confirm(`Korrekturpunkt Nr. ${index + 1} (gemessen ${calibParams[index].t.toFixed(2)} °C) löschen?`)) {
+      return;
+    }
+    const sensorId = originalSession.split('_')[0];
+    try {
+      const remaining = calibParams.filter((_, i) => i !== index);
+      const res = await fetch(buildApiUrl('/calibration'), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sensor_id: sensorId,
+          correction_points: JSON.stringify(remaining),
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Fehler beim Löschen: ${res.statusText}`);
+      }
+      setCalibParams(remaining);
+      fetchSensorData(selected.filter(s => !s.endsWith('_calibrated')));
+      alert("Korrekturpunkt gelöscht.");
+    } catch (error) {
+      console.error("Fehler beim Löschen des Korrekturpunkts:", error);
+      alert("Fehler beim Löschen des Korrekturpunkts. Siehe Konsole für Details.");
+    }
+  };
+
+  // Zeit-Kalibrierung: Faktor K auf 1.0 (kein Faktor) zuruecksetzen.
+  const resetTimeFactor = async () => {
+    const originalSession = getOriginalSession();
+    if (!originalSession) {
+      alert("Bitte mindestens eine Original-Sensor-Session auswählen!");
+      return;
+    }
+    if (!confirm("Zeit-Kalibrierung zuruecksetzen (Faktor K auf 1.0)?")) {
+      return;
+    }
+    const sensorId = originalSession.split('_')[0];
+    try {
+      const res = await fetch(buildApiUrl(`/time_calibration?sensor_id=${encodeURIComponent(sensorId)}`), {
+        method: "DELETE",
+      });
+      if (!res.ok) {
+        throw new Error(`Fehler beim Zuruecksetzen: ${res.statusText}`);
+      }
+      setTimeFactor(null);
+      fetchSensorData(selected.filter(s => !s.endsWith('_calibrated')));
+      alert("Zeit-Kalibrierung zurueckgesetzt (K=1.0).");
+    } catch (error) {
+      console.error("Fehler beim Zuruecksetzen der Zeit-Kalibrierung:", error);
+      alert("Fehler beim Zuruecksetzen der Zeit-Kalibrierung. Siehe Konsole für Details.");
     }
   };
 
@@ -206,6 +286,17 @@ function App() {
     setTimeCalibrationPoint(null);
     setShowTimeInput(false);
     setShowCalibrationType(false);
+  };
+
+  // Kalibrierungsmodus beenden und alle temporären Kalibrier-Zustände aufraeumen.
+  const cancelCalibration = () => {
+    setCalibrationMode(false);
+    setCalibrationType("none");
+    setCalibrationPoints([]);
+    setTimeCalibrationPoint(null);
+    setShowTimeInput(false);
+    // Entferne Preview-Sessions aus Auswahl.
+    setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
   };
 
   // Zeit-Kalibrierung: geklickter Punkt -> Zeit-Eingabe-Modal oeffnen.
@@ -509,12 +600,7 @@ function App() {
                   borderRadius: "2vh",
                   cursor: "pointer",
                 }}
-                onClick={() => {
-                  setCalibrationMode(false);
-                  setCalibrationPoints([]);
-                  // Entferne Preview-Sessions aus Auswahl
-                  setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
-                }}
+                onClick={cancelCalibration}
               >
                 Abbrechen
               </button>
@@ -544,10 +630,10 @@ function App() {
                   borderRadius: "2vh",
                   cursor: "pointer",
                 }}
-                onClick={submitTimeCalibration}
-                disabled={!timeCalibrationPoint}
+                onClick={fetchCalibParams}
+                disabled={calibParamsLoading}
               >
-                Vorschau
+                {calibParamsLoading ? "Lädt..." : "Parameter anzeigen"}
               </button>
               <button
                 style={{
@@ -574,13 +660,7 @@ function App() {
                   borderRadius: "2vh",
                   cursor: "pointer",
                 }}
-                onClick={() => {
-                  setCalibrationMode(false);
-                  setCalibrationType("none");
-                  setTimeCalibrationPoint(null);
-                  setShowTimeInput(false);
-                  setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
-                }}
+                onClick={cancelCalibration}
               >
                 Abbrechen
               </button>
@@ -598,12 +678,7 @@ function App() {
             }}
             onClick={async () => {
               if (calibrationMode) {
-                setCalibrationMode(false);
-                setCalibrationType("none");
-                setCalibrationPoints([]);
-                setTimeCalibrationPoint(null);
-                setShowTimeInput(false);
-                setSelected(prev => prev.filter(s => !s.endsWith('_calibrated')));
+                cancelCalibration();
               } else {
                 if (!selected.some(s => !s.endsWith('_calibrated'))) {
                   alert("Bitte mindestens eine Original-Sensor-Session für die Kalibrierung auswählen!");
@@ -966,8 +1041,32 @@ function App() {
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 style={{ marginTop: 0, marginBottom: 12 }}>📋 Bisherige Kalibrierparameter</h3>
-            {calibParams === null ? (
+            <h3 style={{ marginTop: 0, marginBottom: 12 }}>
+              {calibrationType === "time" ? "⏱ Zeit-Kalibrierparameter" : "🌡 Temperatur-Kalibrierparameter"}
+            </h3>
+            {calibrationType === "time" ? (
+              <div style={{ fontSize: 15 }}>
+                <p style={{ margin: '0 0 12px', color: '#555' }}>
+                  Zeit-Kalibrierungsfaktor <strong>K</strong>:
+                </p>
+                <div style={{ fontSize: 22, fontFamily: 'monospace', marginBottom: 8 }}>
+                  {timeFactor === null ? "1.00 (keine Korrektur)" : timeFactor.toFixed(4)}
+                </div>
+                <p style={{ margin: '0 0 16px', fontSize: 12, color: '#888' }}>
+                  Der Startpunkt bleibt fix; alle weiteren Punkte verschieben sich
+                  entsprechend dem Faktor.
+                </p>
+                <button
+                  onClick={resetTimeFactor}
+                  style={{
+                    padding: '8px 16px', fontSize: 14, cursor: 'pointer',
+                    border: 'none', borderRadius: 8, background: '#dc3545', color: 'white'
+                  }}
+                >
+                  🗑 Faktor zurücksetzen (K=1.0)
+                </button>
+              </div>
+            ) : calibParams === null ? (
               <div style={{ color: '#888', fontSize: 15 }}>Keine Daten geladen.</div>
             ) : calibParams.length === 0 ? (
               <div style={{ color: '#888', fontSize: 15 }}>
@@ -980,6 +1079,9 @@ function App() {
                     <th style={{ textAlign: 'left', padding: '8px' }}>Gemessen (°C)</th>
                     <th style={{ textAlign: 'left', padding: '8px' }}>Delta (K)</th>
                     <th style={{ textAlign: 'left', padding: '8px' }}>Soll (°C)</th>
+                    <th style={{ textAlign: 'right', padding: '8px' }}>
+                      <span title="Korrekturpunkt löschen">🗑</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -988,6 +1090,18 @@ function App() {
                       <td style={{ padding: '8px' }}>{pt.t.toFixed(2)}</td>
                       <td style={{ padding: '8px' }}>{pt.delta >= 0 ? '+' : ''}{pt.delta.toFixed(2)}</td>
                       <td style={{ padding: '8px' }}>{(pt.t + pt.delta).toFixed(2)}</td>
+                      <td style={{ padding: '8px', textAlign: 'right' }}>
+                        <button
+                          onClick={() => deleteCalibrationPoint(i)}
+                          title={`Korrekturpunkt Nr. ${i + 1} löschen`}
+                          style={{
+                            padding: '4px 8px', fontSize: 13, cursor: 'pointer',
+                            border: '1px solid #ccc', borderRadius: 6, background: '#f8f8f8', color: '#222'
+                          }}
+                        >
+                          🗑
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
