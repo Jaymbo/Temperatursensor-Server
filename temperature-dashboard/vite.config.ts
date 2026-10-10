@@ -8,14 +8,17 @@ export default defineConfig({
     environment: 'jsdom',
     coverage: {
       provider: 'v8',
-  reporter: ['text', 'html'],
-  reportsDirectory: 'coverage',
+      reporter: ['text', 'html'],
+      reportsDirectory: 'coverage',
       all: true,
       include: ['src/**/*.{ts,tsx}'],
       // Exclude heavy integration and UI wiring files from unit coverage
       exclude: [
         'src/__tests__/**',
         'src/components/Chart.tsx',
+        // BatteryChart ist wie Chart.tsx ein reiner chart.js-Wrapper; die
+        // Aufbereitung der Serien/Marker ist in utils.ts (100 % getestet).
+        'src/components/BatteryChart.tsx',
         'src/App.tsx',
         'src/main.tsx',
         'src/hooks/**',

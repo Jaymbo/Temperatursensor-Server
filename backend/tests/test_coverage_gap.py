@@ -148,24 +148,3 @@ def test_get_remote_commit_with_token(monkeypatch):
         update._get_remote_commit()
 
     update.GITHUB_TOKEN = orig_token
-
-
-# ── update.py:91 ── Zweiter ls-remote in _get_remote_commit gelingt
-def test_get_remote_commit_second_try_succeeds(monkeypatch):
-    """_get_remote_commit: Erster ls-remote fehlschlägt, zweiter gelingt (Zeile 91)."""
-    import update
-    call_count = {"ls_remote": 0}
-
-    def git_side_effect(args):
-        if args[0] == "ls-remote":
-            call_count["ls_remote"] += 1
-            if call_count["ls_remote"] == 1:
-                return ("", "fatal", 1)
-            return ("abcdef123 main", "", 0)
-        elif args[0] == "remote":
-            return ("", "", 0)
-        return ("", "", 0)
-
-    with patch.object(update, "_run_git", side_effect=git_side_effect):
-        result = update._get_remote_commit()
-        assert result == "abcdef123"

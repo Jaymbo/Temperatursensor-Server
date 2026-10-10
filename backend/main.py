@@ -7,12 +7,22 @@ from db import (
     get_start_time_of_latest_session,
     process_relative_data, clone_latest_session_with_calibration,
     initialize_db, add_or_update_custom_text_entry,
-    get_time_factor, set_time_factor, get_session_start_time, apply_time_factor
+    get_time_factor, set_time_factor, get_session_start_time, apply_time_factor,
+    # Akku-Telemetrie
+    get_session_hw_rev, set_session_hw_rev,
+    get_battery_assignment, add_battery_assignment, close_open_battery_assignment,
+    add_battery_readings, get_battery_readings, get_latest_battery_reading,
+    get_battery_sensor_ids,
+    upsert_battery, get_batteries, replace_battery_sessions, get_battery_sessions,
+    # Strommessung
+    add_power_measurements, add_power_aggregate, get_power_aggregates,
+    get_power_measurements,
 )
 from update import (
     pull_update, get_current_version, check_setup, check_for_update,
     get_admin_password
 )
+import battery_health
 from typing import List, Dict
 import json
 import datetime
@@ -372,6 +382,54 @@ def add_calibration_point(calibration_point: dict):
     return {"status": "success"}
 
 
+def _store_battery_payload(sensor_id: str, session_start: datetime.datetime, payload: dict) -> int:
+    """
+    Legt die im /measurements-Paket mitgesendeten Akku-Werte ab.
+
+    Die Akku-Listen (battery_mv/-seq/-ts/-raw) sind PARALLEL und beziehen sich
+    auf die Geraete-Elapsed-Zeit (battery_ts), NICHT auf die Temperaturliste.
+    Der absolute Messzeitpunkt ist Session-Start + battery_ts. Als received_at
+    wird die Serverzeit gespeichert (bekanntes Zeitdrift-Problem: beide Zeiten
+    werden gehalten, siehe db._create_battery_tables).
+
+    :return: Anzahl der tatsaechlich eingefuegten (plausiblen) Werte.
+    """
+    mv_list = payload.get("battery_mv")
+    if not mv_list:
+        return 0
+
+    seq_list = payload.get("battery_seq") or []
+    ts_list = payload.get("battery_ts") or []
+    raw_list = payload.get("battery_raw") or []
+
+    assignment = get_battery_assignment(sensor_id)
+    battery_id = assignment["battery_id"] if assignment else None
+    hw_rev = get_session_hw_rev(sensor_id)
+    received_at = datetime.datetime.now().isoformat()
+
+    rows = []
+    for i, mv in enumerate(mv_list):
+        if i >= len(ts_list):
+            break
+        try:
+            measured_at = (session_start + datetime.timedelta(
+                seconds=float(ts_list[i]))).isoformat()
+        except (TypeError, ValueError):
+            continue
+        rows.append({
+            "sensor_id": sensor_id,
+            "battery_id": battery_id,
+            "measured_at": measured_at,
+            "received_at": received_at,
+            "mv": mv,
+            "raw": raw_list[i] if i < len(raw_list) else None,
+            "under_load": None,
+            "seq": seq_list[i] if i < len(seq_list) else None,
+            "hw_rev": hw_rev,
+        })
+    return add_battery_readings(rows)
+
+
 @app.post("/measurements")
 async def add_measurements_endpoint(payload: dict):
     """
@@ -380,6 +438,10 @@ async def add_measurements_endpoint(payload: dict):
     - sensor_id: str
     - timestamps: List[float] (erste Eintrag absolut in s, Rest als Differenzen in s)
     - temperatures: List[float] (erste Eintrag absolut, Rest als Differenzen)
+    - hw_rev: int (optional) Hardware-Revision -> wird an der Session vermerkt
+    - battery_mv / battery_seq / battery_ts / battery_raw: optionale, parallele
+      Listen der Akku-Telemetrie (siehe Firmware battery.ino). battery_ts ist die
+      Geraete-Elapsed-Zeit je Messwert (NICHT die der Temperaturliste!).
     """
     sensor_id = payload.get("sensor_id")
     timestamps = payload.get("timestamps")
@@ -409,6 +471,17 @@ async def add_measurements_endpoint(payload: dict):
 
         # Daten in die Datenbank einfügen
         sensor_session = add_temperature_data(sensor_id, absolute_timestamps, absolute_temperatures)
+
+        # Hardware-Revision der laufenden Session merken (erster Wert gewinnt).
+        hw_rev = payload.get("hw_rev")
+        if hw_rev is not None:
+            try:
+                set_session_hw_rev(sensor_id, int(hw_rev))
+            except Exception as e:
+                print(f"hw_rev konnte nicht gespeichert werden: {e}")
+
+        # Akku-Telemetrie ablegen (Zeit = Session-Start + Geraete-Elapsed).
+        _store_battery_payload(sensor_id, start_time, payload)
 
         # Zeit-Kalibrierung: Timestamps relativ zum Session-Start skalieren (fixer Start).
         # Rohdaten in der DB bleiben unveraendert; nur die angezeigten Werte werden verschoben.
@@ -471,6 +544,7 @@ async def update_sensor_session(sensor_id: str):
             "status": "success",
             "new_sensor_session": result["new_sensor_session"],
             "calibration_data": result["calibration_data"],
+            "calibration_hw_rev": get_session_hw_rev(sensor_id),
             "correction_points": result.get("correction_points"),
             "messintervall": result.get("messintervall", 60.0),
             "sendpuffer": result.get("sendpuffer", 10)
@@ -796,3 +870,252 @@ def update_check():
     """Prüft, ob es neue Commits auf origin/main gibt (öffentlich)."""
     result = check_for_update()
     return result
+
+
+# ── Akku-Telemetrie ──────────────────────────────────────────────
+#
+# Aufteilung der Auswertung:
+#   * /battery/summary  -> schnelle Statuszeile je Sensor (Akku-Symbol + Alter)
+#   * /battery/{id}     -> Verlauf eines Sensors (fuer den Chart)
+#   * /battery/fleet    -> Flottenvergleich (relative Metriken)
+#   * /battery/health   -> Vollauswertung inkl. Verdachtsursache
+#
+# Die eigentliche Analyse steckt in battery_health.py; hier werden nur Daten
+# geladen und zusammengefuehrt. Erkannte Betriebsphasen (Laden/Ausfall) werden
+# bei /battery/health zusaetzlich persistiert, damit sie im UI als Marker
+# dienen - die Rohdaten bleiben unberuehrt und die Erkennung aenderbar.
+
+# Erwartetes Sendeintervall fuer die Ausfallerkennung (Firmware-Default).
+_BATTERY_EXPECTED_INTERVAL_S = 10.0
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _reading_age_seconds(reading: dict | None):
+    """Alter eines Messwerts in Sekunden (bevorzugt Geraetezeit, sonst Empfang)."""
+    if not reading:
+        return None
+    ref = _parse_iso(reading.get("measured_at")) or _parse_iso(reading.get("received_at"))
+    if ref is None:
+        return None
+    return max(0.0, (datetime.datetime.now() - ref).total_seconds())
+
+
+@app.get("/battery/summary")
+def battery_summary():
+    """
+    Statuszeile je Sensor: letzter Messwert, Stufe (5 Stufen, KEIN Prozent),
+    Alter der letzten Messung und zugeordneter Akku.
+    """
+    summary = []
+    for sensor_id in get_battery_sensor_ids():
+        reading = get_latest_battery_reading(sensor_id)
+        assignment = get_battery_assignment(sensor_id)
+        summary.append({
+            "sensor_id": sensor_id,
+            "battery_id": assignment["battery_id"] if assignment else None,
+            "latest": reading,
+            "level": battery_health.battery_level_stage(
+                reading["mv"] if reading else None,
+                reading.get("under_load") if reading else None,
+            ),
+            "age_seconds": _reading_age_seconds(reading),
+            "hw_rev": get_session_hw_rev(sensor_id),
+        })
+    return {"summary": summary}
+
+
+@app.get("/battery/fleet")
+def battery_fleet():
+    """
+    Flottenvergleich: relative Metriken je Sensor/Akku, Ausreisser oben.
+    Nutzt bewusst RELATIVE Kennzahlen (Rate, Voll->Abschalt, Ladeverhalten),
+    da ein absoluter Spannungsschwellwert "alt" nicht von "leer" unterscheidet.
+    """
+    per_sensor = {}
+    for sensor_id in get_battery_sensor_ids():
+        readings = get_battery_readings(sensor_id)
+        assignment = get_battery_assignment(sensor_id)
+        per_sensor[sensor_id] = battery_health.analyze_sensor(
+            sensor_id,
+            readings,
+            expected_interval_s=_BATTERY_EXPECTED_INTERVAL_S,
+            hw_rev=get_session_hw_rev(sensor_id),
+            battery_id=assignment["battery_id"] if assignment else None,
+        )
+    return battery_health.build_fleet(per_sensor)
+
+
+@app.get("/battery/health")
+def battery_health_all(sensor_id: str | None = None):
+    """
+    Vollauswertung der Akku-Gesundheit.
+
+    :param sensor_id: optional auf einen Sensor beschraenken
+    """
+    sensor_ids = [sensor_id] if sensor_id else get_battery_sensor_ids()
+    result = {}
+    for sid in sensor_ids:
+        readings = get_battery_readings(sid)
+        assignment = get_battery_assignment(sid)
+        analysis = battery_health.analyze_sensor(
+            sid,
+            readings,
+            expected_interval_s=_BATTERY_EXPECTED_INTERVAL_S,
+            hw_rev=get_session_hw_rev(sid),
+            battery_id=assignment["battery_id"] if assignment else None,
+        )
+        # Erkannte Betriebsphasen ableiten und persistieren (Rohdaten unberuehrt).
+        sessions = analysis["measure_sessions"] + analysis["charge_sessions"] + analysis["outages"]
+        replace_battery_sessions(sid, [
+            {
+                "battery_id": assignment["battery_id"] if assignment else None,
+                "start_time": s["start_time"],
+                "end_time": s.get("end_time"),
+                "type": s["type"],
+                "note": s.get("note"),
+            }
+            for s in sessions
+        ])
+        result[sid] = analysis
+    return {"health": result}
+
+
+@app.get("/battery/{sensor_id}")
+def battery_history(sensor_id: str, limit: int | None = None, since: str | None = None):
+    """Akku-Verlauf eines Sensors (chronologisch) fuer den Chart."""
+    return {
+        "sensor_id": sensor_id,
+        "readings": get_battery_readings(sensor_id, limit=limit, since=since),
+        "sessions": get_battery_sessions(sensor_id),
+        "assignment": get_battery_assignment(sensor_id),
+    }
+
+
+@app.post("/battery")
+def create_or_update_battery(payload: dict):
+    """
+    Legt einen Akku an bzw. aktualisiert seine Stammdaten.
+    Erwartet: {battery_id, capacity_class?, purchase_date?, status?, notes?}
+    """
+    battery_id = payload.get("battery_id")
+    if not battery_id:
+        return {"status": "error", "message": "battery_id ist erforderlich."}
+    upsert_battery(
+        battery_id,
+        capacity_class=payload.get("capacity_class"),
+        purchase_date=payload.get("purchase_date"),
+        status=payload.get("status", "in_use"),
+        notes=payload.get("notes"),
+    )
+    return {"status": "success", "batteries": get_batteries()}
+
+
+@app.post("/battery/assign")
+def assign_battery(payload: dict):
+    """
+    Ordnet einen Akku einem Sensor zu bzw. protokolliert einen Wechsel.
+
+    Erwartet: {sensor_id, battery_id, from_time?, reason?}
+    Bei einem Wechsel wird die offene Zuordnung geschlossen (to_time = from_time).
+    """
+    sensor_id = payload.get("sensor_id")
+    battery_id = payload.get("battery_id")
+    if not sensor_id or not battery_id:
+        return {"status": "error", "message": "sensor_id und battery_id sind erforderlich."}
+    from_time = payload.get("from_time") or datetime.datetime.now().isoformat()
+    reason = payload.get("reason", "initial")
+    close_open_battery_assignment(sensor_id, from_time)
+    add_battery_assignment(sensor_id, battery_id, from_time, reason=reason)
+    return {"status": "success", "assignment": get_battery_assignment(sensor_id)}
+
+
+# ── Strommessung (Mess-ESP mit INA226) ───────────────────────────
+
+
+@app.post("/power/measurements")
+def add_power_measurements_endpoint(payload: dict):
+    """
+    Nimmt Strom-Rohproben des Mess-ESP entgegen.
+
+    Erwartet: {logger_id, timestamps:[...], currents_ma:[...], bus_v?, shunt_mv?,
+               range_ma?, seq?}. Vorzeichen: Entladen positiv, Laden negativ.
+    Der absolute Messzeitpunkt ist received_at (Serverzeit) minus Alter der Probe,
+    wenn 'age_s' mitgesendet wird; sonst Serverzeit.
+    """
+    logger_id = payload.get("logger_id")
+    currents = payload.get("currents_ma")
+    if not logger_id or not currents:
+        return {"status": "error", "message": "logger_id und currents_ma sind erforderlich."}
+
+    timestamps = payload.get("timestamps")
+    received_at = datetime.datetime.now()
+    bus_v = payload.get("bus_v")
+    shunt_mv = payload.get("shunt_mv")
+    range_ma = payload.get("range_ma")
+    seq_list = payload.get("seq") or []
+
+    rows = []
+    for i, current in enumerate(currents):
+        if timestamps and i < len(timestamps):
+            measured_at = (received_at + datetime.timedelta(
+                seconds=float(timestamps[i]))).isoformat()
+        else:
+            measured_at = received_at.isoformat()
+        rows.append({
+            "logger_id": logger_id,
+            "measured_at": measured_at,
+            "received_at": received_at.isoformat(),
+            "current_ma": current,
+            "bus_v": bus_v[i] if isinstance(bus_v, list) and i < len(bus_v) else bus_v,
+            "shunt_mv": shunt_mv[i] if isinstance(shunt_mv, list) and i < len(shunt_mv) else shunt_mv,
+            "range_ma": range_ma,
+            "seq": seq_list[i] if i < len(seq_list) else None,
+        })
+    inserted = add_power_measurements(rows)
+    return {"status": "success", "inserted": inserted}
+
+
+@app.post("/power/aggregate")
+def add_power_aggregate_endpoint(payload: dict):
+    """
+    Nimmt ein Aggregat (Live-Anzeige) entgegen.
+
+    Erwartet: {logger_id, window_start, window_end, samples, current_ma_mean?,
+               current_ma_min?, current_ma_max?, charge_uah?, gap?}
+    charge_uah wird im Mess-ESP durch INTEGRATION der Rohproben berechnet; hier
+    wird es nur gespeichert (Mittelwerte ueber uA/mA waeren bedeutungslos).
+    """
+    logger_id = payload.get("logger_id")
+    if not logger_id or not payload.get("window_start") or not payload.get("window_end"):
+        return {"status": "error", "message": "logger_id, window_start und window_end sind erforderlich."}
+    add_power_aggregate({
+        "logger_id": logger_id,
+        "window_start": payload["window_start"],
+        "window_end": payload["window_end"],
+        "samples": payload.get("samples", 0),
+        "current_ma_mean": payload.get("current_ma_mean"),
+        "current_ma_min": payload.get("current_ma_min"),
+        "current_ma_max": payload.get("current_ma_max"),
+        "charge_uah": payload.get("charge_uah"),
+        "gap": payload.get("gap", False),
+        "received_at": datetime.datetime.now().isoformat(),
+    })
+    return {"status": "success"}
+
+
+@app.get("/power/{logger_id}")
+def power_history(logger_id: str, since: str | None = None, limit: int | None = None):
+    """Aggregate (Live) und Rohproben eines Loggers."""
+    return {
+        "logger_id": logger_id,
+        "aggregates": get_power_aggregates(logger_id, since=since),
+        "measurements": get_power_measurements(logger_id, since=since, limit=limit),
+    }

@@ -1,8 +1,13 @@
 import { useEffect, useState } from "react";
 import { Chart } from "./components/Chart";
 import { SensorSelector } from "./components/SensorSelector";
+import { BatteryBadge } from "./components/BatteryBadge";
+import { BatteryChart } from "./components/BatteryChart";
+import { StatusTable } from "./components/StatusTable";
+import { FleetComparison } from "./components/FleetComparison";
 import { useSensorData } from "./hooks/useSensorData";
 import { useWebSocket } from "./hooks/useWebSocket";
+import { useBatteryData, type BatteryHistory } from "./hooks/useBatteryData";
 import { buildApiUrl, getApiBase } from "./api";
 import { parseCorrectionPoints, type CorrectionPoint, localIso, buildActualTimestamp } from "./utils";
 
@@ -39,6 +44,42 @@ function App() {
   const [timeInput, setTimeInput] = useState<string>("");
 
   const { sensorSessions, data, comments, isLoading, error, fetchSensorData, updateData, updateComments, deleteComment, addNewSensorSession } = useSensorData();
+
+  // Akku-Telemetrie (Statuszeile, Flottenvergleich, Verlauf).
+  const [showBattery, setShowBattery] = useState<boolean>(false);
+  const [batteryChartSensor, setBatteryChartSensor] = useState<string | null>(null);
+  const [batteryHistory, setBatteryHistory] = useState<BatteryHistory | null>(null);
+  const {
+    summary: batterySummary,
+    fleet: batteryFleet,
+    medianRate: batteryMedianRate,
+    loadSummary: loadBatterySummary,
+    loadFleet: loadBatteryFleet,
+    loadHistory: loadBatteryHistory,
+  } = useBatteryData();
+
+  // Beim Oeffnen des Akku-Panels Flotte und Uebersicht (neu) laden.
+  useEffect(() => {
+    if (showBattery) {
+      loadBatteryFleet();
+      loadBatterySummary();
+    }
+  }, [showBattery, loadBatteryFleet, loadBatterySummary]);
+
+  // Verlauf des ausgewaehlten Sensors laden (fuer den Akku-Chart).
+  useEffect(() => {
+    let active = true;
+    if (!batteryChartSensor) {
+      setBatteryHistory(null);
+      return;
+    }
+    loadBatteryHistory(batteryChartSensor).then((h) => {
+      if (active) setBatteryHistory(h);
+    });
+    return () => {
+      active = false;
+    };
+  }, [batteryChartSensor, loadBatteryHistory]);
 
   // Kalibrierungspunkt hinzufügen
   const addCalibrationPoint = async (timestamp: number, measuredTemp: number, targetTemp: number) => {
@@ -406,6 +447,11 @@ function App() {
         const sensor_session = message.sensor_session;
         const {timestamps, temperatures} = message.data;
         updateData(sensor_session, timestamps, temperatures);
+        // Akku-Telemetrie kommt im selben Paket an -> Statuszeile aktualisieren.
+        loadBatterySummary();
+        if (batteryChartSensor) {
+          loadBatteryHistory(batteryChartSensor).then(setBatteryHistory);
+        }
       } else if (message.data?.action === "update_measurements") {
         // NEU: Behandlung für Live-Kalibrierungsvorschau
         const sensor_session = message.sensor_session;
@@ -670,6 +716,20 @@ function App() {
             style={{
               padding: "1vh 1vw",
               fontSize: "4vh",
+              backgroundColor: showBattery ? "#28a745" : "#198754",
+              color: "white",
+              border: "none",
+              borderRadius: "2vh",
+              cursor: "pointer",
+            }}
+            onClick={() => setShowBattery((v) => !v)}
+          >
+            {showBattery ? "Akku schließen" : "Akku"}
+          </button>
+          <button
+            style={{
+              padding: "1vh 1vw",
+              fontSize: "4vh",
               backgroundColor: calibrationMode ? "#dc3545" : "#dc3545",
               color: "white",
               border: "none",
@@ -719,6 +779,11 @@ function App() {
                 setSelected(values);
                 fetchSensorData(values);
               }}
+              batterySummary={batterySummary}
+              onBatteryClick={(sid) => {
+                setBatteryChartSensor(sid);
+                setShowBattery(true);
+              }}
             />
           </div>
           <button
@@ -753,6 +818,96 @@ function App() {
           )}
         </div>
       </div>
+
+      {/* Akku-Panel: Uebersicht, Flottenvergleich und Verlauf */}
+      {showBattery && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Akku-Uebersicht"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999
+          }}
+          onClick={() => setShowBattery(false)}
+        >
+          <div
+            style={{
+              background: '#fff', color: '#222', padding: '24px 28px',
+              borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+              width: '85vw', maxWidth: 1100, maxHeight: '85vh', overflow: 'auto'
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ margin: 0 }}>🔋 Akku-Uebersicht</h3>
+              <button
+                onClick={() => setShowBattery(false)}
+                aria-label="Akku-Uebersicht schließen"
+                style={{
+                  border: 'none', background: '#eee', color: '#333', cursor: 'pointer',
+                  padding: '6px 10px', borderRadius: 8, fontSize: 14
+                }}
+              >
+                Schließen
+              </button>
+            </div>
+
+            <p style={{ margin: '0 0 12px', fontSize: 13, color: '#777' }}>
+              Bewusst 5 Stufen statt Prozent: LiPo ist zwischen ca. 3,7 und 3,9 V
+              zu flach fuer eine ehrliche Prozentangabe. Bewertet wird relativ zur Flotte.
+            </p>
+
+            <div style={{ display: 'flex', gap: '0.6vw', flexWrap: 'wrap', marginBottom: 16 }}>
+              {batterySummary.map((e) => (
+                <BatteryBadge
+                  key={e.sensor_id}
+                  entry={e}
+                  onClick={(sid) => setBatteryChartSensor(sid)}
+                />
+              ))}
+              {batterySummary.length === 0 && (
+                <span style={{ color: '#888', fontSize: '1.8vh' }}>
+                  Noch keine Akku-Messwerte empfangen.
+                </span>
+              )}
+            </div>
+
+            <h4 style={{ margin: '0 0 8px' }}>Status</h4>
+            <StatusTable
+              entries={batteryFleet}
+              onSelect={(sid) => setBatteryChartSensor(sid)}
+            />
+
+            <h4 style={{ margin: '16px 0 8px' }}>Flottenvergleich</h4>
+            <FleetComparison
+              fleet={batteryFleet}
+              medianRate={batteryMedianRate}
+              onSelect={(sid) => setBatteryChartSensor(sid)}
+            />
+
+            <h4 style={{ margin: '16px 0 8px' }}>
+              Verlauf {batteryChartSensor ? `· Sensor #${batteryChartSensor}` : ''}
+            </h4>
+            {batteryChartSensor ? (
+              batteryHistory ? (
+                <BatteryChart
+                  readings={batteryHistory.readings}
+                  sessions={batteryHistory.sessions}
+                />
+              ) : (
+                <div style={{ color: '#888', fontSize: '1.8vh' }}>Lade Verlauf...</div>
+              )
+            ) : (
+              <div style={{ color: '#888', fontSize: '1.8vh' }}>
+                Sensor auswaehlen (Badge, Statuszeile oder Balken anklicken), um den
+                Akku-Verlauf zu sehen.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {showAddSensor && (
         <div

@@ -1,12 +1,18 @@
 import { useState } from "react";
+import { BatteryBadge } from "./BatteryBadge";
+import { latestSessionPerSensor, type BatterySummaryEntry } from "../utils";
 
 interface Props {
   sensorSessions: { sensor_session: string; custom_text: string }[];
   selected: string[];
   onChange: (selected: string[]) => void;
+  /** Akku-Status je Sensor (aus /battery/summary), fuer das Badge. */
+  batterySummary?: BatterySummaryEntry[];
+  /** Klick auf das Akku-Badge (oeffnet den Akku-Verlauf im Panel). */
+  onBatteryClick?: (sensorId: string) => void;
 }
 
-export const SensorSelector = ({ sensorSessions, selected, onChange }: Props) => {
+export const SensorSelector = ({ sensorSessions, selected, onChange, batterySummary, onBatteryClick }: Props) => {
   const [searchTerm, setSearchTerm] = useState("");
 
   const filteredSessions = sensorSessions
@@ -40,6 +46,13 @@ export const SensorSelector = ({ sensorSessions, selected, onChange }: Props) =>
       return getId(b.sensor_session) - getId(a.sensor_session); // absteigend
     });
 
+  // Neueste Session je Sensor (fuer das Akku-Badge): nur dort erscheint das
+  // Symbol, damit die Liste nicht zugeklappt wird.
+  const latestSessions = latestSessionPerSensor(sensorSessions);
+  const summaryBySensor = new Map(
+    (batterySummary ?? []).map((e) => [String(e.sensor_id), e])
+  );
+
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
       <input
@@ -72,6 +85,24 @@ export const SensorSelector = ({ sensorSessions, selected, onChange }: Props) =>
           );
         })}
       </select>
+      {/* Akku-Badges unter der Liste: je Sensor (neueste Session) ein klickbares
+          Symbol + Spannung. Klicken oeffnet den Akku-Verlauf im Akku-Panel. */}
+      {batterySummary && batterySummary.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.3vh", paddingTop: "0.5vh" }}>
+          {Object.entries(latestSessions).map(([sensorId, session]) => {
+            const entry = summaryBySensor.get(sensorId);
+            if (!entry) return null;
+            return (
+              <BatteryBadge
+                key={session}
+                entry={entry}
+                compact
+                onClick={onBatteryClick}
+              />
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 };
