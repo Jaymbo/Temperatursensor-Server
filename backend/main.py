@@ -18,6 +18,7 @@ from db import (
     add_power_measurements, add_power_aggregate, get_power_aggregates,
     get_power_measurements,
 )
+import power_cycles
 from update import (
     pull_update, get_current_version, check_setup, check_for_update,
     get_admin_password
@@ -1119,3 +1120,69 @@ def power_history(logger_id: str, since: str | None = None, limit: int | None = 
         "aggregates": get_power_aggregates(logger_id, since=since),
         "measurements": get_power_measurements(logger_id, since=since, limit=limit),
     }
+
+
+@app.get("/power/cycles/{logger_id}")
+def power_cycles_endpoint(
+    logger_id: str,
+    since: str | None = None,
+    limit: int | None = None,
+    trigger_ma: float | None = None,
+    quiet_ma: float | None = None,
+    min_quiet_s: float | None = None,
+    max_cycle_s: float | None = None,
+    gap_s: float | None = None,
+):
+    """
+    Zyklusanalyse: Segmentierung + Landmarks + Phasen-Dauern je Zyklus.
+
+    Rohdaten bleiben unberuehrt; die Erkennung ist schwellenbasiert und kann
+    per Query-Parameter angepasst werden (Defaults siehe power_cycles.py).
+    """
+    measurements = get_power_measurements(logger_id, since=since, limit=limit)
+    kwargs = {}
+    if trigger_ma is not None:
+        kwargs["trigger_ma"] = trigger_ma
+    if quiet_ma is not None:
+        kwargs["quiet_ma"] = quiet_ma
+    if min_quiet_s is not None:
+        kwargs["min_quiet_s"] = min_quiet_s
+    if max_cycle_s is not None:
+        kwargs["max_cycle_s"] = max_cycle_s
+    if gap_s is not None:
+        kwargs["gap_s"] = gap_s
+    return power_cycles.analyze_cycles(measurements, **kwargs)
+
+
+@app.get("/power/cycles/{logger_id}/overlay")
+def power_cycles_overlay_endpoint(
+    logger_id: str,
+    since: str | None = None,
+    limit: int | None = None,
+    overlay_limit: int = 20,
+    trigger_ma: float | None = None,
+    quiet_ma: float | None = None,
+    min_quiet_s: float | None = None,
+    max_cycle_s: float | None = None,
+    gap_s: float | None = None,
+):
+    """
+    Oszilloskop-Overlay: die letzten `overlay_limit` Zyklen, alle auf t=0
+    (Zyklusanfang/Trigger) synchronisiert, inkl. Landmarks und Phasen.
+    """
+    # Wichtig: fuer die Overlay-Ansicht die VOLLSTAENDIGEN Rohdaten nehmen,
+    # damit die letzten Zyklen nicht durch ein kleines Daten-Limit beschnitten
+    # werden (limit ist hier bewusst nur ein Analyse-Deckel).
+    measurements = get_power_measurements(logger_id, since=since, limit=limit)
+    kwargs = {}
+    if trigger_ma is not None:
+        kwargs["trigger_ma"] = trigger_ma
+    if quiet_ma is not None:
+        kwargs["quiet_ma"] = quiet_ma
+    if min_quiet_s is not None:
+        kwargs["min_quiet_s"] = min_quiet_s
+    if max_cycle_s is not None:
+        kwargs["max_cycle_s"] = max_cycle_s
+    if gap_s is not None:
+        kwargs["gap_s"] = gap_s
+    return power_cycles.build_overlay(measurements, limit=overlay_limit, **kwargs)

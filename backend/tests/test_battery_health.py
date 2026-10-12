@@ -24,8 +24,11 @@ def test_parse_time():
 
 # ── battery_level_stage (5 Stufen, kein Prozent) ─────────────────────────
 
-def test_battery_level_stage_thresholds():
+def test_battery_level_stage_thresholds(monkeypatch):
     # Stufen aus den Defaults voll=4200/leer=3300 (Quartile dazwischen).
+    # Bewusst UNABHAENGIG von backend/battery_thresholds.json getestet:
+    # die Stufenlogik selbst, nicht die konkrete Konfiguration.
+    monkeypatch.setattr(bh, "load_thresholds", lambda: {"full_mv": 4200, "empty_mv": 3300})
     assert bh.battery_level_stage(4200)["stage"] == 5
     assert bh.battery_level_stage(4100)["stage"] == 4
     assert bh.battery_level_stage(3975)["stage"] == 4
@@ -35,6 +38,16 @@ def test_battery_level_stage_thresholds():
     assert bh.battery_level_stage(3400)["stage"] == 1
     assert bh.battery_level_stage(3000)["stage"] == 0
     assert bh.battery_level_stage(3000)["label"] == "leer"
+
+
+def test_battery_level_stage_uses_config_file():
+    # Die produktive Konfiguration (full=4100, empty=3500): Skala endet bei
+    # 4,1 V (schonende Vollladung), "kritisch" ab 3,5 V.
+    assert bh.load_thresholds() == {"full_mv": 4100, "empty_mv": 3500}
+    assert bh.battery_level_stage(4100)["stage"] == 5
+    assert bh.battery_level_stage(3900)["stage"] == 3
+    assert bh.battery_level_stage(3500)["stage"] == 1
+    assert bh.battery_level_stage(3400)["stage"] == 0
 
 
 def test_battery_level_stage_none_and_under_load():
