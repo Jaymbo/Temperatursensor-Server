@@ -69,3 +69,41 @@ describe('usePowerData constants', () => {
     expect(POWER_PHASE_ORDER).toEqual(['pre_peak', 'spike', 'tail']);
   });
 });
+
+describe('PowerOverlayChart avg mode', () => {
+  const avg = {
+    session_id: 42,
+    n_cycles: 3,
+    t_s: [0.0, 5.0, 6.0, 10.0],
+    mean: [74.5, 135.0, 74.5, 74.5],
+    std: [0.0, 2.0, 1.5, 0.0],
+    duration_median_s: 10.0,
+    peak_ma_median: 135.0,
+    landmarks: { trigger: { start_s: 5.0 }, spike_end: { start_s: 6.0 } },
+    phases: {
+      pre_peak: { start_s: 0.0, end_s: 5.0, duration_s: 5.0 },
+      spike: { start_s: 5.0, end_s: 6.0, duration_s: 1.0 },
+      tail: { start_s: 6.0, end_s: 10.0, duration_s: 4.0 },
+    },
+  };
+
+  it('renders session average with band (canvas, 2 datasets)', () => {
+    // Hinweis: Labels/Band liegen im Canvas (Chart.js), nicht im DOM-Text.
+    // Geprueft wird: Canvas rendert + keine Fehler (avg-Pfad laeuft durch).
+    const { container, unmount } = render(<PowerOverlayChart cycles={[]} avg={[avg]} />);
+    expect(container.querySelector('canvas')).not.toBeNull();
+    unmount();
+  });
+
+  it('falls back to cycles when avg is empty', () => {
+    const { container, unmount } = render(<PowerOverlayChart cycles={[cycle]} avg={[]} />);
+    expect(container.textContent).toContain('TX-Burst');
+    unmount();
+  });
+
+  it('avg prop optional (undefined renders cycles)', () => {
+    const { container, unmount } = render(<PowerOverlayChart cycles={[cycle]} />);
+    expect(container.textContent).toContain('TX-Burst');
+    unmount();
+  });
+});

@@ -7,15 +7,16 @@ import {
   Title,
   Tooltip,
   Legend,
+  Filler,
   type ChartData,
   type ChartOptions,
 } from "chart.js";
 import zoomPlugin from "chartjs-plugin-zoom";
 import { Line } from "react-chartjs-2";
-import { POWER_PHASE_ORDER, type PowerCycle } from "../hooks/usePowerData";
+import { POWER_PHASE_ORDER, type PowerCycle, type PowerSessionAvg } from "../hooks/usePowerData";
 
 ChartJS.register(LineElement, PointElement, LinearScale, Title, Tooltip, Legend,
-  zoomPlugin);
+  Filler, zoomPlugin);
 
 /**
  * Oszilloskop-Overlay: alle Zyklen uebereinander, synchronisiert auf t=0
@@ -49,6 +50,8 @@ const LANDMARK_LABEL: Record<string, string> = {
 
 interface Props {
   cycles: PowerCycle[];
+  /** Session-Durchschnitte (Standard-Ansicht mode="avg"). */
+  avg?: PowerSessionAvg[];
   height?: string;
   /**
    * Wird nach einem Zoom/Pan mit dem sichtbaren Fenster (Sekunden seit
@@ -59,7 +62,8 @@ interface Props {
   onZoomWindow?: (win: { startS: number; endS: number } | null) => void;
 }
 
-export const PowerOverlayChart = ({ cycles, height = "45vh", onZoomWindow }: Props) => {
+export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoomWindow }: Props) => {
+  const avg = avgProp ?? [];
   const chartRef = useRef<any>(null);
   const zoomDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -81,7 +85,42 @@ export const PowerOverlayChart = ({ cycles, height = "45vh", onZoomWindow }: Pro
   const chartData = useMemo<ChartData<"line">>(() => {
     const datasets: ChartData<"line">["datasets"] = [];
 
-    // Zyklen-Kurven (letzte zuerst zeichnen, damit die neueste oben liegt).
+    // Standard-Ansicht (mode="avg"): pro Session Mittelwert-Kurve mit
+    // +/- Standardabweichung als halbtransparentem Band. Wenige Punkte,
+    // Abweichler zwischen Sessions sind direkt als Bandbreite sichtbar.
+    if (avg && avg.length > 0) {
+      avg.forEach((s, i) => {
+        const color = CYCLE_COLORS[i % CYCLE_COLORS.length];
+        const points = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] }));
+        // Band: upper-Linie vorwaerts, lower-Linie rueckwaerts (fill '-1').
+        const bandUpper = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] + s.std[k] }));
+        const bandLower = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] - s.std[k] }));
+        datasets.push({
+          label: `Session ${s.session_id ?? "?"} · Ø ${s.n_cycles} Zyklen`,
+          data: points,
+          borderColor: color,
+          backgroundColor: color,
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false,
+          tension: 0,
+        });
+        datasets.push({
+          label: `±σ Session ${s.session_id ?? "?"}`,
+          data: [...bandUpper, ...bandLower.slice().reverse()],
+          borderColor: color,
+          backgroundColor: `${color}33`,
+          borderWidth: 0,
+          pointRadius: 0,
+          fill: true,
+          tension: 0,
+        });
+      });
+      return { datasets };
+    }
+
+    // Einzelzyklen-Overlay (mode="cycles", letzte zuerst zeichnen, damit die
+    // neueste oben liegt).
     const ordered = [...cycles].reverse();
     ordered.forEach((c, i) => {
       const color = CYCLE_COLORS[i % CYCLE_COLORS.length];
@@ -113,11 +152,15 @@ export const PowerOverlayChart = ({ cycles, height = "45vh", onZoomWindow }: Pro
     });
 
     return { datasets };
-  }, [cycles]);
+  }, [cycles, avg]);
 
   const maxT = useMemo(
-    () => Math.max(1, ...cycles.map((c) => (c.t_s.length ? c.t_s[c.t_s.length - 1] : 0))),
-    [cycles]
+    () => Math.max(
+      1,
+      ...cycles.map((c) => (c.t_s.length ? c.t_s[c.t_s.length - 1] : 0)),
+      ...((avg ?? []).map((s) => (s.t_s.length ? s.t_s[s.t_s.length - 1] : 0))),
+    ),
+    [cycles, avg]
   );
 
   const options: ChartOptions<"line"> = {
@@ -136,7 +179,7 @@ export const PowerOverlayChart = ({ cycles, height = "45vh", onZoomWindow }: Pro
       },
     },
     plugins: {
-      legend: { display: cycles.length > 1 },
+      legend: { display: cycles.length > 1 || avg.length > 1 },
       tooltip: {
         callbacks: {
           label: (ctx) => `${Number(ctx.parsed.y).toFixed(1)} mA @ t=${Number(ctx.parsed.x).toFixed(3)} s`,
@@ -172,7 +215,7 @@ export const PowerOverlayChart = ({ cycles, height = "45vh", onZoomWindow }: Pro
     },
   };
 
-  if (cycles.length === 0) {
+  if (cycles.length === 0 && avg.length === 0) {
     return (
       <div style={{ color: "#888", fontSize: "1.8vh" }}>
         Keine Zyklen erkannt (keine Stromdaten oder Schwellwerte zu streng).

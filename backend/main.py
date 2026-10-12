@@ -1062,6 +1062,20 @@ def _power_cycle_kwargs(
 # ── Strommessung (Mess-ESP mit INA226) ───────────────────────────
 
 
+@app.get("/sessions")
+def sessions_list():
+    """
+    Alle Sessions fuer die Auswahl im Power-Panel (neueste zuerst).
+
+    Die Strom-Zyklen werden serverseitig den Temperatursessions zugeordnet
+    (Firmware-Versionen); dieses Listing liefert die Auswahloptionen mit
+    Beschriftung (custom_text) und Startzeit.
+    """
+    sessions = db.get_sessions_chronological()
+    sessions.reverse()  # neueste zuerst
+    return {"sessions": sessions}
+
+
 @app.get("/power/loggers")
 def power_loggers():
     """Logger-IDs mit Stromproben (neueste Aktivitaet zuerst)."""
@@ -1207,6 +1221,10 @@ def power_cycles_overlay_endpoint(
     since: str | None = None,
     limit: int | None = None,
     overlay_limit: int = 20,
+    mode: str = "avg",
+    session_ids: str | None = None,
+    avg_step_s: float = power_cycles.DEFAULT_AVG_STEP_S,
+    avg_cycle_limit: int = power_cycles.DEFAULT_AVG_CYCLE_LIMIT,
     window_start_s: float | None = None,
     window_end_s: float | None = None,
     max_points_per_cycle: int = 500,
@@ -1218,8 +1236,16 @@ def power_cycles_overlay_endpoint(
     gap_s: float | None = None,
 ):
     """
-    Oszilloskop-Overlay: die letzten `overlay_limit` Zyklen, alle auf t=0
-    (Zyklusanfang) synchronisiert, inkl. Landmarks und Phasen.
+    Oszilloskop-Overlay / Session-Vergleich fuer einen Logger.
+
+    mode="avg" (Standard): pro Temperatursession eine Mittelwert-Kurve +/-,
+    Standardabweichung ueber alle Zyklen der Session - wenige Punkte und
+    Abweichler/Firmware-Differenzen sind direkt als Band sichtbar. `session_ids`
+    (kommasepariert) beschraenkt die Anzeige auf gewaehlte Sessions; ohne
+    Filter erscheinen alle.
+
+    mode="cycles": klassisches Einzelzyklen-Overlay (letzte `overlay_limit`
+    Zyklen, synchronisiert auf t=0).
 
     Performance: Rohproben werden per LTTB auf `max_points_per_cycle` Punkte
     pro Zyklus reduziert (Default 500 statt ~10.000). Beim Reinzoomen ruft
@@ -1233,7 +1259,25 @@ def power_cycles_overlay_endpoint(
                                  spike_end_ma, max_cycle_s, gap_s)
     analysis, samples = _get_cached_power_analysis(
         logger_id, since=since, limit=limit, kwargs=kwargs)
+    if mode != "cycles":
+        sid_filter = None
+        if session_ids:
+            try:
+                sid_filter = [int(s) for s in session_ids.split(",") if s.strip()]
+            except ValueError:
+                raise HTTPException(
+                    status_code=422,
+                    detail="session_ids muss eine kommagetrennte Liste von "
+                           "Ganzzahlen sein.")
+        sessions = db.get_sessions_chronological()
+        avg = _get_cached_session_average(
+            logger_id, sid_filter, avg_step_s, avg_cycle_limit,
+            window_start_s, window_end_s,
+            analysis, samples, sessions,
+        )
+        return {**avg, "stats": analysis["stats"]}
     return {
+        "mode": "cycles",
         "cycles": power_cycles._render_overlay_cycles(
             analysis, samples, limit=overlay_limit,
             window_start_s=window_start_s, window_end_s=window_end_s,
@@ -1326,3 +1370,75 @@ def _get_cached_power_analysis(
             "samples": samples,
         }
     return analysis, samples
+
+
+# --- Session-Average-Render-Cache --------------------------------------------
+#
+# render_session_average resampelt alle Zyklen einer Session auf ein gemeinsames
+# Raster (~0,5 s bei 1,6 Mio. Rohproben). Beim Zoom-Nachladen soll das im
+# ms-Bereich antworten: Das fertige avg-Ergebnis wird therefore ebenfalls
+# gecacht (gleiche TTL/Fingerprint-Logik wie der Analyse-Cache). Schluessel:
+# (logger, Session-Filter, step, cycle_limit, Fenster).
+_SESSION_AVG_CACHE_TTL_S = 5.0
+_session_avg_cache: dict = {}
+_session_avg_lock = threading.Lock()
+
+
+def _session_avg_cache_key(
+    logger_id: str,
+    session_ids: list[int] | None,
+    step_s: float,
+    cycle_limit: int,
+    window_start_s: float | None,
+    window_end_s: float | None,
+) -> tuple:
+    return (logger_id,
+            tuple(session_ids) if session_ids is not None else None,
+            step_s, cycle_limit, window_start_s, window_end_s)
+
+
+def _get_cached_session_average(
+    logger_id: str,
+    session_ids: list[int] | None,
+    step_s: float,
+    cycle_limit: int,
+    window_start_s: float | None,
+    window_end_s: float | None,
+    analysis: dict,
+    samples: list,
+    sessions: list[dict],
+) -> dict:
+    """render_session_average mit Cache (vgl. _get_cached_power_analysis)."""
+    key = _session_avg_cache_key(
+        logger_id, session_ids, step_s, cycle_limit,
+        window_start_s, window_end_s)
+    now = time.monotonic()
+    with _session_avg_lock:
+        entry = _session_avg_cache.get(key)
+        if entry is not None and now - entry["ts"] < _SESSION_AVG_CACHE_TTL_S:
+            cached_fp = entry["fingerprint"]
+        else:
+            cached_fp = None
+
+    if cached_fp is not None:
+        if _power_fingerprint(logger_id) == cached_fp:
+            with _session_avg_lock:
+                entry["ts"] = now  # TTL verlaengern
+            return entry["avg"]
+        with _session_avg_lock:
+            _session_avg_cache.pop(key, None)
+
+    avg = power_cycles.render_session_average(
+        analysis, samples, sessions=sessions,
+        session_ids=session_ids, step_s=step_s, cycle_limit=cycle_limit,
+        window_start_s=window_start_s, window_end_s=window_end_s,
+    )
+    with _session_avg_lock:
+        if len(_session_avg_cache) >= 8:
+            _session_avg_cache.clear()
+        _session_avg_cache[key] = {
+            "ts": now,
+            "fingerprint": _power_fingerprint(logger_id),
+            "avg": avg,
+        }
+    return avg

@@ -55,6 +55,11 @@ function App() {
   const [batteryHistory, setBatteryHistory] = useState<BatteryHistory | null>(null);
   const [showPower, setShowPower] = useState<boolean>(false);
   const [powerLogger, setPowerLogger] = useState<string | null>(null);
+  // Overlay-Modus: "avg" (Standard: Mittelwert +/- std pro Session) oder
+  // "cycles" (Einzelzyklen uebereinander).
+  const [powerMode, setPowerMode] = useState<"avg" | "cycles">("avg");
+  // Mehrfachauswahl der Sessions (Firmware-Versionen); leer = alle anzeigen.
+  const [powerSessionFilter, setPowerSessionFilter] = useState<number[]>([]);
   // Gezoomtes Overlay-Fenster (Sekunden seit Zyklusanfang) -> Nachladen in
   // voller Aufloesung; null = Gesamtansicht (downgesampelt).
   const [powerZoomWindow, setPowerZoomWindow] = useState<{ startS: number; endS: number } | null>(null);
@@ -76,10 +81,11 @@ function App() {
     }
   }, [showBattery, loadBatteryFleet, loadBatterySummary]);
 
-  // Strom-Analyse: beim Oeffnen die verfuegbaren Logger laden.
+  // Strom-Analyse: beim Oeffnen die verfuegbaren Logger + Session-Liste laden.
   useEffect(() => {
     if (showPower) {
       power.loadLoggers();
+      power.loadSessionOptions();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showPower]);
@@ -88,9 +94,19 @@ function App() {
   useEffect(() => {
     if (!powerLogger) return;
     setPowerZoomWindow(null); // Logger-Wechsel: Zoom zuruecksetzen
-    power.loadCycles(powerLogger);
+    power.loadCycles(powerLogger, 20, undefined, 500, powerMode,
+      powerSessionFilter);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [powerLogger]);
+
+  // Mode-/Session-Auswahl geaendert -> neu laden (Zoom zuruecksetzen).
+  useEffect(() => {
+    if (!powerLogger) return;
+    setPowerZoomWindow(null);
+    power.loadCycles(powerLogger, 20, undefined, 500, powerMode,
+      powerSessionFilter);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [powerMode, powerSessionFilter]);
 
   // Zoom-Fenster geaendert -> Overlay-Ausschnitt in voller Aufloesung nachladen.
   // Nur das Overlay (loadOverlay), nicht die Statistik - die aendert sich beim
@@ -98,7 +114,7 @@ function App() {
   useEffect(() => {
     if (!powerLogger) return;
     power.loadOverlay(powerLogger, powerZoomWindow ?? undefined,
-      powerZoomWindow ? 5000 : 500);
+      powerZoomWindow ? 5000 : 500, 20, powerMode, powerSessionFilter);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [powerZoomWindow]);
 
@@ -1035,7 +1051,67 @@ function App() {
                   <h4 style={{ margin: '0 0 8px' }}>
                     Zyklus-Overlay · Logger #{powerLogger}
                   </h4>
-                  <PowerOverlayChart cycles={power.cycles} onZoomWindow={setPowerZoomWindow} />
+
+                  {/* Modus: Session-Durchschnitt (Standard) vs. Einzelzyklen */}
+                  <div style={{ display: 'flex', gap: 8, marginBottom: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      onClick={() => setPowerMode('avg')}
+                      style={{
+                        padding: '4px 10px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
+                        border: powerMode === 'avg' ? '2px solid #e07b00' : '1px solid #ccc',
+                        background: powerMode === 'avg' ? '#ffe8d0' : '#fff',
+                      }}
+                    >
+                      Ø ± Streubereich (Standard)
+                    </button>
+                    <button
+                      onClick={() => setPowerMode('cycles')}
+                      style={{
+                        padding: '4px 10px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
+                        border: powerMode === 'cycles' ? '2px solid #e07b00' : '1px solid #ccc',
+                        background: powerMode === 'cycles' ? '#ffe8d0' : '#fff',
+                      }}
+                    >
+                      Einzelzyklen
+                    </button>
+                  </div>
+
+                  {/* Session-Mehrfachauswahl (avg-Modus: Filter, leer = alle) */}
+                  {powerMode === 'avg' && power.sessionOptions.length > 0 && (
+                    <div style={{ marginBottom: 12, maxHeight: '18vh', overflowY: 'auto', border: '1px solid #ddd', borderRadius: 8, padding: 8 }}>
+                      <div style={{ fontSize: 13, color: '#555', marginBottom: 6 }}>
+                        Sessions anzeigen ({powerSessionFilter.length === 0 ? 'alle' : `${powerSessionFilter.length} gewählt`}):
+                      </div>
+                      {power.sessionOptions.map((s) => (
+                        <label key={s.id} style={{ display: 'block', fontSize: 13, padding: '2px 0', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={powerSessionFilter.includes(s.id)}
+                            onChange={(e) => {
+                              setPowerSessionFilter((prev) =>
+                                e.target.checked ? [...prev, s.id] : prev.filter((x) => x !== s.id)
+                              );
+                            }}
+                            style={{ marginRight: 6 }}
+                          />
+                          {s.custom_text || `Session ${s.id}`}
+                          <span style={{ color: '#999', marginLeft: 6 }}>
+                            {s.start_time.slice(0, 16).replace('T', ' ')}
+                          </span>
+                        </label>
+                      ))}
+                      {powerSessionFilter.length > 0 && (
+                        <button
+                          onClick={() => setPowerSessionFilter([])}
+                          style={{ marginTop: 4, fontSize: 12, cursor: 'pointer', border: '1px solid #ccc', borderRadius: 6, padding: '2px 8px', background: '#fff' }}
+                        >
+                          Alle anzeigen
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  <PowerOverlayChart cycles={power.cycles} avg={power.avg} onZoomWindow={setPowerZoomWindow} />
                   <h4 style={{ margin: '16px 0 8px' }}>Phasen-Dauern (min / Median / max)</h4>
                   <PowerPhaseTable stats={power.stats} />
                   <h4 style={{ margin: '16px 0 8px' }}>Verbrauch pro Session (Firmware-Versionsvergleich)</h4>

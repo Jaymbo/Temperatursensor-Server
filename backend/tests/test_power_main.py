@@ -97,7 +97,7 @@ def test_power_cycles_overlay(client):
         wlan_duration_s=2.5, offset_s=PROFILE_DURATION_S
     )
     _post_samples(client, "3", pts)
-    data = client.get("/power/cycles/3/overlay").json()
+    data = client.get("/power/cycles/3/overlay", params={"mode": "cycles"}).json()
     # Beide Zyklen synchronisiert auf t=0 (Zyklusanfang)
     assert len(data["cycles"]) == 2
     first = data["cycles"][0]
@@ -114,13 +114,13 @@ def test_power_cycles_overlay_limit(client):
     pts = _profile_chain(5)
     _post_samples(client, "4", pts)
     data = client.get(
-        "/power/cycles/4/overlay", params={"overlay_limit": 2}
+        "/power/cycles/4/overlay", params={"overlay_limit": 2, "mode": "cycles"}
     ).json()
     assert len(data["cycles"]) == 2
 
 
 def test_power_cycles_overlay_empty(client):
-    data = client.get("/power/cycles/unbekannt/overlay").json()
+    data = client.get("/power/cycles/unbekannt/overlay", params={"mode": "cycles"}).json()
     assert data["cycles"] == []
 
 
@@ -252,15 +252,15 @@ def test_overlay_cache_hit_is_fast_and_fresh(client, monkeypatch):
     # Cache leeren (globales Dict), damit der Test deterministisch ist
     mainmod._overlay_cache.clear()
 
-    first = client.get("/power/cycles/7/overlay").json()
+    first = client.get("/power/cycles/7/overlay", params={"mode": "cycles"}).json()
     assert calls["n"] == 1
-    second = client.get("/power/cycles/7/overlay").json()
+    second = client.get("/power/cycles/7/overlay", params={"mode": "cycles"}).json()
     assert calls["n"] == 1  # Cache-Hit: keine erneute Messwert-Abfrage
     assert second["cycles"] == first["cycles"]
 
     # Zoom-Fenster auf Cache-Hit rendern (nur Fensterschnitt + LTTB)
     win = client.get("/power/cycles/7/overlay",
-                     params={"window_start_s": 4.0, "window_end_s": 6.0}).json()
+                     params={"mode": "cycles", "window_start_s": 4.0, "window_end_s": 6.0}).json()
     assert win["cycles"][0]["t_s"][0] == 0.0
     assert win["cycles"][0]["landmarks"]["trigger"]["start_s"] == pytest.approx(1.0, abs=0.01)
 
@@ -270,14 +270,14 @@ def test_overlay_cache_invalidated_on_new_data(client):
     import main as mainmod
     mainmod._overlay_cache.clear()
     _post_samples(client, "8", _synthetic_profile())
-    first = client.get("/power/cycles/8/overlay").json()
+    first = client.get("/power/cycles/8/overlay", params={"mode": "cycles"}).json()
     assert len(first["cycles"]) == 1
 
     # Neue Proben anhaengen -> zweiter Zyklus -> Cache muss aktualisieren
     pts = _synthetic_profile()
     offset = 10.0
     _post_samples(client, "8", [(t + offset, ma) for t, ma in pts])
-    second = client.get("/power/cycles/8/overlay").json()
+    second = client.get("/power/cycles/8/overlay", params={"mode": "cycles"}).json()
     assert len(second["cycles"]) == 2
 
 
@@ -286,14 +286,14 @@ def test_overlay_cache_ttl_expiry(client, monkeypatch):
     import main as mainmod
     mainmod._overlay_cache.clear()
     _post_samples(client, "9", _synthetic_profile())
-    client.get("/power/cycles/9/overlay").json()
+    client.get("/power/cycles/9/overlay", params={"mode": "cycles"}).json()
 
     # TTL kuenstlich ablaufen lassen: ts zuruecksetzen
     for entry in mainmod._overlay_cache.values():
         entry["ts"] -= mainmod._OVERLAY_CACHE_TTL_S + 1.0
 
     # Fingerprint gleich -> Cache wird trotzdem weiterverwendet (Abfrage ok)
-    data = client.get("/power/cycles/9/overlay").json()
+    data = client.get("/power/cycles/9/overlay", params={"mode": "cycles"}).json()
     assert len(data["cycles"]) == 1
 
 
@@ -310,5 +310,276 @@ def test_overlay_cache_eviction(client):
     mainmod._overlay_cache.clear()
     for i in range(9):
         _post_samples(client, f"e{i}", _synthetic_profile())
-        client.get(f"/power/cycles/e{i}/overlay").json()
+        client.get(f"/power/cycles/e{i}/overlay", params={"mode": "cycles"}).json()
     assert len(mainmod._overlay_cache) <= 8
+
+
+# ── Overlay mode="avg" (Session-Durchschnitt, Standard-Ansicht) ───────────
+
+def _create_sessions(client, specs: list[tuple[str, str | None]]):
+    """Sessions ueber /update/{sensor_id} anlegen (wie Firmware-Release)."""
+    out = []
+    for sensor_id, custom_text in specs:
+        if custom_text is not None:
+            client.post("/custom-text", json={"custom_text": custom_text})
+        res = client.post(f"/update/{sensor_id}").json()
+        session_id = int(res["new_sensor_session"].split("_", 1)[1])
+        out.append({"id": session_id, "sensor_id": sensor_id})
+    return out
+
+
+def test_overlay_avg_mode_default(client):
+    """Default-Modus 'avg': Mittelwert + std je Session statt Einzelzyklen."""
+    pts = _profile_chain(3)
+    _post_samples(client, "a1", pts)
+    data = client.get("/power/cycles/a1/overlay").json()
+    assert "avg" in data and "cycles" not in data
+    assert len(data["avg"]) == 1
+    s = data["avg"][0]
+    assert s["session_id"] is None  # keine Sessions angelegt -> alle None
+    assert s["n_cycles"] == 3
+    assert len(s["t_s"]) == len(s["mean"]) == len(s["std"])
+    # Grundlast-Mittelwert ~74.5, Spike-Mittelwert ~135: Peak bleibt sichtbar.
+    assert max(s["mean"]) == pytest.approx(135.0, abs=2.0)
+    assert s["std"][0] == 0.0  # identische Zyklen -> keine Streuung am Anfang
+    # Landmarks aus dem Median-Zyklus mitgeliefert
+    assert s["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.05)
+
+
+def test_overlay_avg_mode_std_band_with_outlier(client):
+    """Abweichender Zyklus zeigt sich als std > 0 im Band."""
+    pts = _profile_chain(2)
+    # Dritter Zyklus mit laengerem Burst -> Streuung in der Spike-Phase
+    pts += _synthetic_profile(wlan_duration_s=2.5, offset_s=2 * PROFILE_DURATION_S)
+    _post_samples(client, "a2", pts)
+    data = client.get("/power/cycles/a2/overlay").json()
+    s = data["avg"][0]
+    assert s["n_cycles"] == 3
+    # In der Spike-Phase (t ~5..7 s) Streuung, am Start (Grundlast) keine.
+    idx_spike = min(range(len(s["t_s"])), key=lambda i: abs(s["t_s"][i] - 6.0))
+    assert s["std"][idx_spike] > 0.5
+    assert s["std"][0] == 0.0
+
+
+def test_overlay_avg_mode_session_filter(client):
+    """session_ids-Filter: nur die gewaehlten Sessions erscheinen."""
+    created = _create_sessions(client, [("1", None), (None, None)])
+    _post_samples(client, "a3", _profile_chain(2))
+    data = client.get(
+        "/power/cycles/a3/overlay",
+        params={"session_ids": str(created[0]["id"])},
+    ).json()
+    # Beide Zyklen liegen nach beiden Session-Starts -> sonst gefiltert.
+    assert data["avg"] == []
+
+
+def test_overlay_avg_mode_session_selected(client):
+    """Session-Filter greift: gewaehlte Session bleibt, andere faellt raus."""
+    created = _create_sessions(client, [("1", None), (None, None)])
+    _post_samples(client, "a4", _profile_chain(2))
+    data = client.get("/power/cycles/a4/overlay").json()
+    assert len(data["avg"]) == 1
+    assert data["avg"][0]["session_id"] == created[-1]["id"]
+    data2 = client.get(
+        "/power/cycles/a4/overlay",
+        params={"session_ids": f"{created[0]['id']},{created[1]['id']}"},
+    ).json()
+    assert len(data2["avg"]) == 1  # nur eine Session hat Zyklen
+
+
+def test_overlay_avg_mode_invalid_session_ids(client):
+    """Kaputte session_ids -> 422."""
+    _post_samples(client, "a5", _profile_chain(1))
+    res = client.get(
+        "/power/cycles/a5/overlay", params={"session_ids": "x,y"})
+    assert res.status_code == 422
+
+
+def test_overlay_avg_mode_window(client):
+    """Zoom-Fenster im avg-Modus: Raster nur ueber das Fenster."""
+    pts = _profile_chain(3)
+    _post_samples(client, "a6", pts)
+    data = client.get(
+        "/power/cycles/a6/overlay",
+        params={"window_start_s": 4.0, "window_end_s": 6.0},
+    ).json()
+    s = data["avg"][0]
+    assert s["t_s"][0] == pytest.approx(0.0, abs=0.01)
+    assert s["t_s"][-1] == pytest.approx(2.0, abs=0.05)
+    assert len(s["t_s"]) < 150  # 2 s / 20 ms ~ 100 Punkte
+    # Trigger fensterrelativ bei 5.0 - 4.0 = 1.0 s
+    assert s["landmarks"]["trigger"]["start_s"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_render_session_average_unit_empty(client):
+    """Keine Zyklen -> leeres avg."""
+    out = power_cycles.render_session_average(
+        {"cycles": []}, [], sessions=[])
+    assert out == {"avg": []}
+
+
+def test_render_session_average_unit_truncated_skipped(client):
+    """Truncated-Zyklen gehen nicht in den Mittelwert."""
+    import datetime as dt
+    base = dt.datetime(2026, 10, 12, 12, 0, 0)
+    pts = _profile_chain(2)
+    m = [{"measured_at": (base + dt.timedelta(seconds=t)).isoformat(),
+          "current_ma": ma} for t, ma in pts]
+    analysis = power_cycles.analyze_cycles(m)
+    assert all(not c["truncated"] for c in analysis["cycles"])
+    samples = power_cycles._prepare_samples(m)
+    out = power_cycles.render_session_average(analysis, samples)
+    assert out["avg"][0]["n_cycles"] == 2
+
+
+def test_render_session_average_unit_edge_cases(client):
+    """Randfaelle: leeres Fenster, zu kurze Zyklen, Interpolation."""
+    import datetime as dt
+    base = dt.datetime(2026, 10, 12, 12, 0, 0)
+    pts = _profile_chain(2)
+    m = [{"measured_at": (base + dt.timedelta(seconds=t)).isoformat(),
+          "current_ma": ma} for t, ma in pts]
+    analysis = power_cycles.analyze_cycles(m)
+    samples = power_cycles._prepare_samples(m)
+
+    # 1. Fenster ausserhalb aller Zyklen -> hi <= lo -> leeres Ergebnis.
+    out = power_cycles.render_session_average(
+        analysis, samples, window_start_s=50.0, window_end_s=60.0)
+    assert out == {"avg": []}
+
+    # 2. Zyklus zu kurz (< 2 Samples im Schnitt) -> kein Absturz, leer.
+    short = power_cycles.analyze_cycles([{"measured_at": m[0]["measured_at"],
+                                          "current_ma": 74.5}])
+    out2 = power_cycles.render_session_average(short, samples[:1])
+    assert out2 == {"avg": []}
+
+    # 2b. Konstruierte Analyse mit 2 Zyklen: resampeln scheitert (ct < 2
+    #     Samples) bzw. nur ein Zyklus resampelbar -> std-Zweig.
+    fake_cycle = {
+        "start": m[0]["measured_at"], "t0_s": 0.0, "duration_s": 1.0,
+        "peak_ma": 135.0, "truncated": False, "gap": False,
+        "landmarks": {"trigger": {"start_s": 0.5}, "spike_end": None},
+        "phases": {"pre_peak": {"start_s": 0.0, "end_s": 0.5, "duration_s": 0.5},
+                   "spike": {"start_s": 0.5, "end_s": 1.0, "duration_s": 0.5},
+                   "tail": {"start_s": 1.0, "end_s": 1.0, "duration_s": 0.0}},
+        "charge_uah": 0.2,
+    }
+    # samples decken nur den ersten Zyklus ab -> zweiter Zyklus: ct < 2.
+    analysis2 = {"cycles": [fake_cycle, {**fake_cycle, "t0_s": 1000.0}]}
+    out2b = power_cycles.render_session_average(analysis2, samples[:300])
+    assert out2b["avg"][0]["n_cycles"] == 1
+    assert all(v == 0.0 for v in out2b["avg"][0]["std"])  # Single-Col-Zweig
+
+    # 2c. Alle Zyklen resampeln nicht -> komplett leer.
+    analysis3 = {"cycles": [{**fake_cycle, "t0_s": 1000.0}]}
+    out2c = power_cycles.render_session_average(analysis3, samples[:300])
+    assert out2c == {"avg": []}
+
+    # 2d. Beide Zyklen resampelbar -> std > 0 (Zweizweig) moeglich: zwei
+    #     identische Zyklen -> std = 0, aber Mehr-Zyklen-Pfad geprueft.
+    analysis4 = {"cycles": [fake_cycle, {**fake_cycle}]}
+    out2d = power_cycles.render_session_average(analysis4, samples[:300])
+    assert out2d["avg"][0]["n_cycles"] == 2
+    assert all(v == 0.0 for v in out2d["avg"][0]["std"])
+
+    # 3. _interp_grid: Rand-Klemmung + lineare Interpolation.
+    col = power_cycles._interp_grid(
+        [0.0, 1.0], [10.0, 20.0], [-1.0, 0.5, 2.0])
+    assert col == [10.0, 15.0, 20.0]
+    # Eine Kurve mit < 2 Punkten ist vom Aufrufer ausgeschlossen; der
+    # Index-Zugriff waere hier ungueltig - deshalb nur 2+-Punkt-Kurven.
+
+    # 4. Mehrere Sessions -> Gruppen getrennt, Reihenfolge chronologisch.
+    sessions = [
+        {"id": 5, "start_time": (base - dt.timedelta(seconds=100)).isoformat()},
+        {"id": 7, "start_time": (base + dt.timedelta(seconds=100)).isoformat()},
+    ]
+    out3 = power_cycles.render_session_average(analysis, samples, sessions=sessions)
+    # Beide Zyklen (t=0..20) liegen nach Session 5, vor Session 7 -> nur 5.
+    assert [s["session_id"] for s in out3["avg"]] == [5]
+    # Filter auf Session 7 -> leer.
+    out4 = power_cycles.render_session_average(
+        analysis, samples, sessions=sessions, session_ids=[7])
+    assert out4 == {"avg": []}
+
+
+def test_sessions_list_endpoint(client):
+    """GET /sessions: Auswahl-Listing, neueste Session zuerst."""
+    created = _create_sessions(client, [("1", None), (None, None)])
+    data = client.get("/sessions").json()
+    ids = [s["id"] for s in data["sessions"]]
+    assert created[-1]["id"] in ids and created[0]["id"] in ids
+    # Neueste zuerst (absteigende IDs reichen als chronologischer Proxy).
+    assert ids[0] == max(ids)
+    assert all("start_time" in s and "custom_text" in s for s in data["sessions"])
+
+
+# ── Session-Average-Render-Cache ─────────────────────────────────────────
+
+def test_session_avg_cache_hit_and_fresh(client, monkeypatch):
+    """Zweiter avg-Request innerhalb der TTL: Cache-Hit, kein Neurendern."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    _post_samples(client, "c1", _profile_chain(2))
+
+    calls = {"n": 0}
+    orig = mainmod.power_cycles.render_session_average
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(mainmod.power_cycles, "render_session_average", counting)
+    first = client.get("/power/cycles/c1/overlay").json()
+    assert calls["n"] == 1
+    second = client.get("/power/cycles/c1/overlay").json()
+    assert calls["n"] == 1  # Cache-Hit
+    assert second["avg"] == first["avg"]
+
+
+def test_session_avg_cache_invalidated_on_new_data(client):
+    """Neue Proben -> Fingerprint aendert sich -> avg wird neu berechnet."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    _post_samples(client, "c2", _profile_chain(1))
+    first = client.get("/power/cycles/c2/overlay").json()
+    assert len(first["avg"]) == 1
+    _post_samples(client, "c2", _synthetic_profile(offset_s=PROFILE_DURATION_S))
+    second = client.get("/power/cycles/c2/overlay").json()
+    assert second["avg"][0]["n_cycles"] == 2
+
+
+def test_session_avg_cache_ttl_expiry(client):
+    """Abgelaufene TTL: Fingerprint-Pruefung, bei Gleichheit weiterverwendet."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    _post_samples(client, "c3", _profile_chain(1))
+    client.get("/power/cycles/c3/overlay").json()
+    for entry in mainmod._session_avg_cache.values():
+        entry["ts"] -= mainmod._SESSION_AVG_CACHE_TTL_S + 1.0
+    data = client.get("/power/cycles/c3/overlay").json()
+    assert len(data["avg"]) == 1
+
+
+def test_session_avg_cache_eviction(client):
+    """Mehr als 8 Eintraege -> Cache geleert (Groessenbegrenzung)."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    for i in range(9):
+        _post_samples(client, f"f{i}", _profile_chain(1))
+        client.get(f"/power/cycles/f{i}/overlay").json()
+    assert len(mainmod._session_avg_cache) <= 8
+
+
+def test_session_avg_cache_different_keys(client):
+    """Verschiedene Session-Filter/Fenster fuehren zu separaten Eintraegen."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    created = _create_sessions(client, [("1", None), (None, None)])
+    _post_samples(client, "c4", _profile_chain(1))
+    client.get("/power/cycles/c4/overlay").json()
+    client.get("/power/cycles/c4/overlay",
+               params={"session_ids": str(created[0]["id"])}).json()
+    client.get("/power/cycles/c4/overlay",
+               params={"window_start_s": 0.0, "window_end_s": 5.0}).json()
+    assert len(mainmod._session_avg_cache) == 3

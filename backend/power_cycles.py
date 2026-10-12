@@ -578,3 +578,186 @@ def build_overlay(
         ),
         "stats": analysis["stats"],
     }
+
+
+# --- Session-Durchschnitt (Standard-Ansicht) --------------------------------
+
+# Raster fuer den Session-Mittelwert: Aufloesung in Sekunden (Default 20 ms).
+# Kleiner = glaetter, aber mehr Punkte fuer das Frontend; 20 ms reichen, um
+# TX-Burst-Form und Spike-Ende sauber abzubilden, und ergeben bei 10-s-Zyklen
+# 500 Punkte je Session-Kurve.
+DEFAULT_AVG_STEP_S = 0.02
+
+# Max. Zyklen pro Session, die in den Mittelwert eingehen (aeltere fallen
+# raus) - begrenzt die Rechenlast bei sehr langen Sessions.
+DEFAULT_AVG_CYCLE_LIMIT = 200
+
+# Deckel fuer die Punkte je Session-Kurve: Das Raster wird an die laengste
+# Zyklusdauer angepasst (step >= max_dur / MAX_AVG_POINTS), damit lange
+# Zyklen (echte Daten: 60-240 s statt 10 s) nicht 12k-Punkt-Kurven erzeugen
+# (Render-Last Backend + Chart-Frontend).
+MAX_AVG_POINTS = 600
+
+
+def render_session_average(
+    analysis: dict,
+    samples: list[tuple[float, float]],
+    sessions: list[dict] | None = None,
+    session_ids: list[int] | None = None,
+    step_s: float = DEFAULT_AVG_STEP_S,
+    cycle_limit: int = DEFAULT_AVG_CYCLE_LIMIT,
+    window_start_s: float | None = None,
+    window_end_s: float | None = None,
+) -> dict:
+    """
+    Standard-Ansicht: pro Session Mittelwert-Kurve +/- Standardabweichung.
+
+    Alle Zyklen einer Session (letzte `cycle_limit`) werden auf ein
+    gemeinsames Raster (0 .. laengste Zyklusdauer, Abstand `step_s`)
+    resampelt; je Rasterpunkt werden Mittelwert und Standardabweichung
+    berechnet. Ergebnis: WENIG Punkte (500 je Session statt 500 je Zyklus
+    mal 20 Zyklen) und der Streubereich zeigt Abweichler/Firmware-Differenzen
+    direkt im Chart.
+
+    @param analysis  Ergebnis von analyze_cycles (Zyklen ohne session_id)
+    @param samples   Rohproben [(t_abs_s, current_ma), ...] aufsteigend
+    @param sessions  Session-Liste wie db.get_sessions_chronological()
+                     (None = keine Zuordnung, alle Zyklen unter session_id None)
+    @param session_ids  Filter (None = alle Sessions); Reihenfolge bleibt
+                        chronologisch (aeste Session zuerst)
+    @return {"avg": [{session_id, t_s: [...], mean: [...], std: [...],
+                      n_cycles, duration_median_s, landmarks: {...}}]}
+            t_s/mean/std gleich lang; std = 0 bei n_cycles == 1.
+    """
+    ts_all = [t for t, _ in samples]
+    # Zyklen chronologisch (aeste zuerst) - die letzten cycle_limit je Session
+    # gehen in den Mittelwert. Truncated-Zyklen (Deckel) verfaelschen den
+    # Mittelwert am Ende -> ausschliessen.
+    cycles = [c for c in analysis["cycles"] if not c.get("truncated")]
+    if sessions:
+        cycles = assign_sessions_to_cycles(cycles, sessions)
+    groups: dict = {}
+    for c in cycles:
+        groups.setdefault(c.get("session_id"), []).append(c)
+
+    wanted = set(session_ids) if session_ids is not None else None
+    # Fenstergrenzen (achsenrelativ) vorab bestimmen.
+    w0 = window_start_s if window_start_s is not None else None
+    w1 = window_end_s if window_end_s is not None else None
+    step = max(step_s, 1e-3)
+
+    out = []
+    for sid in sorted(groups, key=lambda s: (s is None, s)):
+        if wanted is not None and sid not in wanted:
+            continue
+        group = groups[sid][-int(cycle_limit):]
+        n = len(group)
+        # Gemeinsames Raster ueber die laengste Dauer im Fenster.
+        max_dur = max((c["duration_s"] for c in group), default=0.0)
+        lo = w0 if w0 is not None else 0.0
+        hi = min(w1, max_dur) if (w1 is not None and w1 < max_dur) else max_dur
+        if hi <= lo:
+            continue
+        # Raster fensterrelativ (0-basiert); die Abtastung je Zyklus mappt
+        # auf t0 + lo + g (Absolutzeit im Stream). Punkt-Deckel: bei sehr
+        # langen Zyklen vergroessert sich der Schritt (kein 12k-Punkt-Chart).
+        span = hi - lo
+        step = max(step_s, span / max(MAX_AVG_POINTS, 1))
+        grid_t = []
+        g = 0.0
+        while g < (hi - lo) - 1e-9:
+            grid_t.append(round(g, 4))
+            g += step
+        grid_t.append(round(hi - lo, 4))
+
+        # Resampling je Zyklus (Bisect-Schnitt + linear. Interpolation).
+        cols: list[list[float]] = []
+        for c in group:
+            t0 = c["t0_s"]
+            i0 = bisect.bisect_left(ts_all, t0 + lo - 1e-6)
+            i1 = bisect.bisect_right(ts_all, t0 + hi + 1e-6)
+            ct = [samples[i][0] - t0 for i in range(i0, i1)]
+            cma = [samples[i][1] for i in range(i0, i1)]
+            if len(ct) < 2:
+                continue
+            cols.append(_interp_grid(ct, cma, [lo + g for g in grid_t]))
+
+        if not cols:
+            continue
+        # n_cycles = Zyklen, die wirklich im Mittelwert stecken (resampelbar).
+        # Mittelwert/Varianz je Rasterpunkt in EINEM Durchlauf ueber die
+        # Spalten (statt je Rasterpunkt ueber alle Zyklen zu iterieren).
+        m = len(cols)
+        sums = [0.0] * len(grid_t)
+        for col in cols:
+            for j, v in enumerate(col):
+                sums[j] += v
+        mean = [round(s / m, 3) for s in sums]
+        if m == 1:
+            std = [0.0] * len(grid_t)
+        else:
+            var_sums = [0.0] * len(grid_t)
+            for col in cols:
+                for j, v in enumerate(col):
+                    d = v - sums[j] / m
+                    var_sums[j] += d * d
+            std = [round((vs / (m - 1)) ** 0.5, 3) for vs in var_sums]
+
+        # Landmarks/Phasen aus dem Median-Zyklus (repraesentativ); bei
+        # Zoom-Fenster auf die fensterrelative Achse mitverschieben (wie
+        # _render_overlay_cycles).
+        durs = [c["duration_s"] for c in group]
+        median_c = group[min(range(n), key=lambda i: abs(durs[i] - statistics.median(durs)))]
+        lm = median_c["landmarks"]
+        ph = median_c["phases"]
+        if w0 is not None:
+            lm = {
+                name: ({"start_s": round(v["start_s"] - w0, 3)} if v else None)
+                for name, v in lm.items()
+            }
+            ph = {
+                name: {
+                    "start_s": round(p["start_s"] - w0, 3),
+                    "end_s": round(p["end_s"] - w0, 3),
+                    "duration_s": p["duration_s"],
+                }
+                for name, p in ph.items()
+            }
+        out.append({
+            "session_id": sid,
+            "n_cycles": len(cols),
+            "t_s": grid_t,
+            "mean": mean,
+            "std": std,
+            "duration_median_s": round(statistics.median(durs), 3),
+            "peak_ma_median": round(statistics.median(c["peak_ma"] for c in group), 3),
+            "landmarks": lm,
+            "phases": ph,
+        })
+    return {"avg": out}
+
+
+def _interp_grid(
+    t: list[float],
+    ma: list[float],
+    grid: list[float],
+) -> list[float] | None:
+    """
+    Linear. Interpolation einer Kurve (t, ma) auf ein Raster. Rasterpunkte
+    ausserhalb der Kurve werden auf den Randwert geklemmt (alle Zyklen sind
+    auf t=0 synchronisiert, leichte Dauer-Differenzen betreffen nur das Ende).
+    Der Aufrufer filtert Kurven mit weniger als 2 Punkten vorher heraus.
+    """
+    out = []
+    for g in grid:
+        if g <= t[0]:
+            out.append(ma[0])
+        elif g >= t[-1]:
+            out.append(ma[-1])
+        else:
+            # bisect_right: erster Index mit t[i] > g -> t[i-1] <= g < t[i]
+            i = bisect.bisect_right(t, g)
+            span = t[i] - t[i - 1]
+            f = (g - t[i - 1]) / span if span > 0 else 0.0
+            out.append(ma[i - 1] + f * (ma[i] - ma[i - 1]))
+    return out
