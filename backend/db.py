@@ -1144,3 +1144,16 @@ def get_power_measurements(logger_id: str, since: str | None = None,
         }
         for r in rows
     ]
+
+
+def get_power_logger_ids() -> list[str]:
+    """Logger-IDs, fuer die Stromproben vorliegen (neueste zuerst)."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT logger_id, MAX(measured_at) FROM power_measurements "
+        "GROUP BY logger_id ORDER BY MAX(measured_at) DESC"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in rows]

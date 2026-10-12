@@ -16,7 +16,7 @@ from db import (
     upsert_battery, get_batteries, replace_battery_sessions, get_battery_sessions,
     # Strommessung
     add_power_measurements, add_power_aggregate, get_power_aggregates,
-    get_power_measurements,
+    get_power_measurements, get_power_logger_ids,
 )
 import power_cycles
 from update import (
@@ -1039,6 +1039,12 @@ def assign_battery(payload: dict):
 
 
 # ── Strommessung (Mess-ESP mit INA226) ───────────────────────────
+
+
+@app.get("/power/loggers")
+def power_loggers():
+    """Logger-IDs mit Stromproben (neueste Aktivitaet zuerst)."""
+    return {"loggers": get_power_logger_ids()}
 
 
 @app.post("/power/measurements")

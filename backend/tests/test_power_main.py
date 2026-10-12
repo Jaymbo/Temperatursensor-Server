@@ -124,3 +124,17 @@ def test_power_cycles_overlay_limit(client):
 def test_power_cycles_overlay_empty(client):
     data = client.get("/power/cycles/unbekannt/overlay").json()
     assert data["cycles"] == []
+
+
+# ── GET /power/loggers ───────────────────────────────────────────────────
+
+def test_power_loggers_sorted_by_latest(client):
+    _post_samples(client, "2", _synthetic_profile(offset_s=100.0))
+    _post_samples(client, "1", _synthetic_profile())
+    res = client.get("/power/loggers")
+    # Neueste Aktivitaet zuerst
+    assert res.json()["loggers"] == ["2", "1"]
+
+
+def test_power_loggers_empty(client):
+    assert client.get("/power/loggers").json() == {"loggers": []}

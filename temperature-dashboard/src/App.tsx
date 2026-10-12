@@ -8,6 +8,9 @@ import { FleetComparison } from "./components/FleetComparison";
 import { useSensorData } from "./hooks/useSensorData";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { useBatteryData, type BatteryHistory } from "./hooks/useBatteryData";
+import { usePowerData } from "./hooks/usePowerData";
+import { PowerOverlayChart } from "./components/PowerOverlayChart";
+import { PowerPhaseTable } from "./components/PowerPhaseTable";
 import { buildApiUrl, getApiBase } from "./api";
 import { parseCorrectionPoints, type CorrectionPoint, localIso, buildActualTimestamp } from "./utils";
 
@@ -49,6 +52,9 @@ function App() {
   const [showBattery, setShowBattery] = useState<boolean>(false);
   const [batteryChartSensor, setBatteryChartSensor] = useState<string | null>(null);
   const [batteryHistory, setBatteryHistory] = useState<BatteryHistory | null>(null);
+  const [showPower, setShowPower] = useState<boolean>(false);
+  const [powerLogger, setPowerLogger] = useState<string | null>(null);
+  const power = usePowerData();
   const {
     summary: batterySummary,
     fleet: batteryFleet,
@@ -65,6 +71,21 @@ function App() {
       loadBatterySummary();
     }
   }, [showBattery, loadBatteryFleet, loadBatterySummary]);
+
+  // Strom-Analyse: beim Oeffnen die verfuegbaren Logger laden.
+  useEffect(() => {
+    if (showPower) {
+      power.loadLoggers();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showPower]);
+
+  // Logger-Auswahl -> Zyklen + Statistik laden.
+  useEffect(() => {
+    if (!powerLogger) return;
+    power.loadCycles(powerLogger);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [powerLogger]);
 
   // Verlauf des ausgewaehlten Sensors laden (fuer den Akku-Chart).
   useEffect(() => {
@@ -730,6 +751,20 @@ function App() {
             style={{
               padding: "1vh 1vw",
               fontSize: "4vh",
+              backgroundColor: showPower ? "#fd7e14" : "#e07b00",
+              color: "white",
+              border: "none",
+              borderRadius: "2vh",
+              cursor: "pointer",
+            }}
+            onClick={() => setShowPower((v) => !v)}
+          >
+            {showPower ? "Strom schließen" : "Strom"}
+          </button>
+          <button
+            style={{
+              padding: "1vh 1vw",
+              fontSize: "4vh",
               backgroundColor: calibrationMode ? "#dc3545" : "#dc3545",
               color: "white",
               border: "none",
@@ -903,6 +938,96 @@ function App() {
               <div style={{ color: '#888', fontSize: '1.8vh' }}>
                 Sensor auswaehlen (Badge, Statuszeile oder Balken anklicken), um den
                 Akku-Verlauf zu sehen.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Strom-Panel: Zyklus-Overlay + Phasen-Dauern */}
+      {showPower && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Strom-Analyse"
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 9999
+          }}
+          onClick={() => setShowPower(false)}
+        >
+          <div
+            style={{
+              background: '#fff', color: '#222', padding: '24px 28px',
+              borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+              width: '85vw', maxWidth: 1100, maxHeight: '85vh', overflow: 'auto'
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+              <h3 style={{ margin: 0 }}>⚡ Strom-Analyse</h3>
+              <button
+                onClick={() => setShowPower(false)}
+                aria-label="Strom-Analyse schließen"
+                style={{
+                  border: 'none', background: '#eee', color: '#333', cursor: 'pointer',
+                  padding: '6px 10px', borderRadius: 8, fontSize: 14
+                }}
+              >
+                Schließen
+              </button>
+            </div>
+
+            <p style={{ margin: '0 0 12px', fontSize: 13, color: '#777' }}>
+              Oszilloskop-Ansicht: Alle Messzyklen werden am Stromanstieg (Trigger)
+              auf t=0 überlagert. Die Phasen-Dauern unten zeigen z. B., ob der
+              WLAN-Connect mal kurz (0,8 s) und mal lang (2,3 s) dauert.
+            </p>
+
+            {power.error && (
+              <div style={{ color: '#d32f2f', fontSize: 14, marginBottom: 8 }}>{power.error}</div>
+            )}
+
+            {/* Logger-Auswahl */}
+            <div style={{ display: 'flex', gap: '0.6vw', flexWrap: 'wrap', marginBottom: 16 }}>
+              {power.loggers.map((id) => (
+                <button
+                  key={id}
+                  onClick={() => setPowerLogger(id)}
+                  style={{
+                    padding: '6px 12px', borderRadius: 8, fontSize: 14,
+                    border: powerLogger === id ? '2px solid #e07b00' : '1px solid #ccc',
+                    background: powerLogger === id ? '#ffe8d0' : '#fff',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Logger #{id}
+                </button>
+              ))}
+              {power.loggers.length === 0 && !power.isLoading && (
+                <span style={{ color: '#888', fontSize: '1.8vh' }}>
+                  Noch keine Strom-Messwerte empfangen.
+                </span>
+              )}
+            </div>
+
+            {powerLogger ? (
+              power.isLoading ? (
+                <div style={{ color: '#888', fontSize: '1.8vh' }}>Lade Zyklen...</div>
+              ) : (
+                <>
+                  <h4 style={{ margin: '0 0 8px' }}>
+                    Zyklus-Overlay · Logger #{powerLogger}
+                  </h4>
+                  <PowerOverlayChart cycles={power.cycles} />
+                  <h4 style={{ margin: '16px 0 8px' }}>Phasen-Dauern (min / Median / max)</h4>
+                  <PowerPhaseTable stats={power.stats} />
+                </>
+              )
+            ) : (
+              <div style={{ color: '#888', fontSize: '1.8vh' }}>
+                Logger auswaehlen, um die Zyklus-Analyse zu sehen.
               </div>
             )}
           </div>

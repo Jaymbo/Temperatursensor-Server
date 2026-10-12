@@ -1,0 +1,93 @@
+import { useCallback, useState } from "react";
+import { buildApiUrl } from "../api";
+
+/**
+ * Laedt die Strom-Zyklusanalyse vom Server (/power/loggers, /power/cycles).
+ *
+ * Wie useBatteryData bewusst getrennt: Die Strom-Rohproben haben ein ganz
+ * anderes Zeit-Raster (200 Hz Dauerstream) als die Temperatur-/Akku-Daten.
+ * Die Auswertung (Zyklus-Trigger, Phasen, Overlay) macht das Backend
+ * (backend/power_cycles.py) - hier kommen nur die aufbereiteten Daten an.
+ */
+
+export interface PowerLandmark {
+  start_s: number;
+}
+
+export interface PowerPhase {
+  start_s: number;
+  end_s: number;
+  duration_s: number;
+}
+
+export interface PowerCycle {
+  start: string;
+  duration_s: number;
+  peak_ma: number;
+  truncated: boolean;
+  gap: boolean;
+  landmarks: Record<string, PowerLandmark | null>;
+  phases: Record<string, PowerPhase>;
+  t_s: number[];
+  ma: number[];
+}
+
+export interface PowerPhaseStat {
+  n: number;
+  min_s: number;
+  median_s: number;
+  max_s: number;
+}
+
+/** Reihenfolge der Phasen fuer die Tabelle (wie im Backend definiert). */
+export const POWER_PHASE_ORDER = ["wake", "measure", "wlan", "send_tail"] as const;
+
+export const usePowerData = () => {
+  const [loggers, setLoggers] = useState<string[]>([]);
+  const [cycles, setCycles] = useState<PowerCycle[]>([]);
+  const [stats, setStats] = useState<Record<string, PowerPhaseStat>>({});
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadLoggers = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(buildApiUrl("/power/loggers"));
+      if (!res.ok) throw new Error(`Fehler beim Laden der Logger: ${res.statusText}`);
+      const data = await res.json();
+      setLoggers(data.loggers || []);
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Laden der Strom-Logger.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const loadCycles = useCallback(async (loggerId: string, overlayLimit = 20) => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      // Overlay (Rohkurven je Zyklus) und Statistik (Phasen-Dauern) parallel.
+      const [overlayRes, cyclesRes] = await Promise.all([
+        fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}`)),
+        fetch(buildApiUrl(`/power/cycles/${loggerId}`)),
+      ]);
+      if (!overlayRes.ok || !cyclesRes.ok) {
+        throw new Error("Fehler beim Laden der Zyklusanalyse.");
+      }
+      const overlay = await overlayRes.json();
+      const cyclesData = await cyclesRes.json();
+      setCycles(overlay.cycles || []);
+      setStats(cyclesData.stats || {});
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Laden der Zyklusanalyse.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  return { loggers, cycles, stats, isLoading, error, loadLoggers, loadCycles };
+};
