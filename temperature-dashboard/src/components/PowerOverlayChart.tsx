@@ -60,12 +60,53 @@ interface Props {
    * `null` = Zoom zurueckgesetzt -> wieder die uebersichtliche Ansicht.
    */
   onZoomWindow?: (win: { startS: number; endS: number } | null) => void;
+  /**
+   * Aktuelles Zoom-Fenster (Mirror des App-State). Nötig für den Sync nach
+   * dem Zoom-Nachladen: Der Server liefert die Daten dann FENSTERRELATIV
+   * (0-basiert), der Zoom-Zustand des Charts bleibt aber absolut -> ohne
+   * Sync zeigt der Chart ins Leere und "Zoom in die Mitte" wirkt kaputt.
+   */
+  zoomWindow?: { startS: number; endS: number } | null;
 }
 
-export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoomWindow }: Props) => {
+export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoomWindow, zoomWindow }: Props) => {
   const avg = avgProp ?? [];
   const chartRef = useRef<any>(null);
   const zoomDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // true, waehrend der Sichtbereich PROGRAMMATISCH gesetzt wird (Sync nach
+  // dem Nachladen). Der programmatische Zoom feuert onZoomComplete -> ohne
+  // Flag wuerde das erneut ein Nachladen (Endlosschleife) triggern.
+  const suppressReportRef = useRef(false);
+  // Ref-Mirror von zoomWindow: Die zoom/pan-Callbacks brauchen das AKTUELLE
+  // Fenster (Absolutstart), ohne von Render-Reihenfolgen abhaengig zu sein.
+  const zoomWindowRef = useRef(zoomWindow);
+  zoomWindowRef.current = zoomWindow;
+
+  /**
+   * Sync nach dem Zoom-Nachladen: Der Server liefert die Daten FENSTERRELATIV
+   * (0-basiert, siehe zoomWindow-Doc), der Chart-Zustand bleibt aber beim
+   * absoluten Zoomfenster stehen. Deshalb: Sichtbereich programmatisch auf
+   * das neue Fenster setzen (0 .. Fensterspanne). Wird bei jedem Daten-Update
+   * ausgefuehrt, wenn ein Fenster aktiv ist.
+   */
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (!zoomWindow) {
+      // Zoom zurueckgesetzt: Gesamtansicht wiederherstellen.
+      chart.resetZoom?.();
+      return;
+    }
+    const span = Math.max(zoomWindow.endS - zoomWindow.startS, 1e-3);
+    suppressReportRef.current = true;
+    try {
+      // Der Sync-Effekt laeuft NACH dem Daten-Update (chartData-Memo),
+      // sodass der neue fensterrelative Datensatz im Chart ist.
+      chart.zoom?.({ x: { min: 0, max: span } }, undefined, { suppressUpdate: false });
+    } finally {
+      suppressReportRef.current = false;
+    }
+  }, [cycles, avg, zoomWindow]);
 
   // Esc = Zoom zuruecksetzen (wie im Haupt-Chart) -> uebersichtliche Ansicht.
   useEffect(() => {
@@ -82,6 +123,7 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
       if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
     };
   }, [onZoomWindow]);
+
   const chartData = useMemo<ChartData<"line">>(() => {
     const datasets: ChartData<"line">["datasets"] = [];
 
@@ -92,9 +134,12 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
       avg.forEach((s, i) => {
         const color = CYCLE_COLORS[i % CYCLE_COLORS.length];
         const points = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] }));
-        // Band: upper-Linie vorwaerts, lower-Linie rueckwaerts (fill '-1').
-        const bandUpper = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] + s.std[k] }));
+        // Band als klassisches Fill-Muster: lower-Linie (unsichtbar) +
+        // upper-Linie mit fill:"-1" -> Flaeche ZWISCHEN den Linien, nicht
+        // bis zur Nulllinie. (fill:true ueber das geschlossene Polygon
+        // schoett den Bereich unter lower mit ein - das Band "schrumpelt".)
         const bandLower = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] - s.std[k] }));
+        const bandUpper = s.t_s.map((t, k) => ({ x: t, y: s.mean[k] + s.std[k] }));
         datasets.push({
           label: `Session ${s.session_id ?? "?"} · Ø ${s.n_cycles} Zyklen`,
           data: points,
@@ -107,12 +152,23 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
         });
         datasets.push({
           label: `±σ Session ${s.session_id ?? "?"}`,
-          data: [...bandUpper, ...bandLower.slice().reverse()],
+          data: bandLower,
           borderColor: color,
           backgroundColor: `${color}33`,
           borderWidth: 0,
           pointRadius: 0,
-          fill: true,
+          fill: false,
+          tension: 0,
+        });
+        // fill:"-1" = Flaeche zwischen upper- und lower-Linie.
+        datasets.push({
+          label: `±σ upper Session ${s.session_id ?? "?"}`,
+          data: bandUpper,
+          borderColor: color,
+          backgroundColor: `${color}33`,
+          borderWidth: 0,
+          pointRadius: 0,
+          fill: "-1",
           tension: 0,
         });
       });
@@ -193,10 +249,16 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
           // Nach dem Zoom das Fenster melden (debounced, damit schnelles
           // Mausraden nicht jede Stufe nachlaedt).
           onZoomComplete: ({ chart }: any) => {
+            if (suppressReportRef.current) return;
             if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
             const x = chart.scales.x;
             zoomDebounceRef.current = setTimeout(() => {
-              onZoomWindow?.({ startS: x.min, endS: x.max });
+              // Fensternachladen liefert fensterrelative Daten (0-basiert).
+              // Zurueckgerechnet auf absolute Fensterkoordinaten (Absolutstart
+              // aus dem Ref-Mirror), sonst pannst der naechste Zoom weg.
+              const w = zoomWindowRef.current;
+              const off = w ? w.startS : 0;
+              onZoomWindow?.({ startS: off + x.min, endS: off + x.max });
             }, 400);
           },
         },
@@ -204,10 +266,14 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
           enabled: true,
           mode: "x" as const,
           onPanComplete: ({ chart }: any) => {
+            if (suppressReportRef.current) return;
             if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
             const x = chart.scales.x;
             zoomDebounceRef.current = setTimeout(() => {
-              onZoomWindow?.({ startS: x.min, endS: x.max });
+              // Wie onZoomComplete: fensterrelativ -> absolut zurueckrechnen.
+              const w = zoomWindowRef.current;
+              const off = w ? w.startS : 0;
+              onZoomWindow?.({ startS: off + x.min, endS: off + x.max });
             }, 400);
           },
         },

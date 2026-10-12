@@ -1111,7 +1111,12 @@ function App() {
                     </div>
                   )}
 
-                  <PowerOverlayChart cycles={power.cycles} avg={power.avg} onZoomWindow={setPowerZoomWindow} />
+                  <PowerOverlayChart
+                    cycles={power.cycles}
+                    avg={power.avg}
+                    onZoomWindow={setPowerZoomWindow}
+                    zoomWindow={powerZoomWindow}
+                  />
                   <h4 style={{ margin: '16px 0 8px' }}>Phasen-Dauern (min / Median / max)</h4>
                   <PowerPhaseTable stats={power.stats} />
                   <h4 style={{ margin: '16px 0 8px' }}>Verbrauch pro Session (Firmware-Versionsvergleich)</h4>
