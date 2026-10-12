@@ -260,10 +260,11 @@ def test_overlay_cache_hit_is_fast_and_fresh(client, monkeypatch):
     assert second["cycles"] == first["cycles"]
 
     # Zoom-Fenster auf Cache-Hit rendern (nur Fensterschnitt + LTTB)
+    # ABSOLUTE Koordinaten: Fensteranfang bleibt bei 4.0, Trigger bei 5.0.
     win = client.get("/power/cycles/7/overlay",
                      params={"mode": "cycles", "window_start_s": 4.0, "window_end_s": 6.0}).json()
-    assert win["cycles"][0]["t_s"][0] == 0.0
-    assert win["cycles"][0]["landmarks"]["trigger"]["start_s"] == pytest.approx(1.0, abs=0.01)
+    assert win["cycles"][0]["t_s"][0] == pytest.approx(4.0, abs=0.01)
+    assert win["cycles"][0]["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.01)
 
 
 def test_overlay_cache_invalidated_on_new_data(client):
@@ -491,11 +492,12 @@ def test_overlay_avg_mode_window(client):
         params={"window_start_s": 4.0, "window_end_s": 6.0},
     ).json()
     s = data["avg"][0]
-    assert s["t_s"][0] == pytest.approx(0.0, abs=0.01)
-    assert s["t_s"][-1] == pytest.approx(2.0, abs=0.05)
+    # ABSOLUTE Koordinaten: Raster laeuft 4.0 .. 6.0 (kein Rebasieren auf 0).
+    assert s["t_s"][0] == pytest.approx(4.0, abs=0.01)
+    assert s["t_s"][-1] == pytest.approx(6.0, abs=0.05)
     assert len(s["t_s"]) < 150  # 2 s / 20 ms ~ 100 Punkte
-    # Trigger fensterrelativ bei 5.0 - 4.0 = 1.0 s
-    assert s["landmarks"]["trigger"]["start_s"] == pytest.approx(1.0, abs=0.05)
+    # Trigger bleibt absolut bei 5.0 s
+    assert s["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.05)
 
 
 def test_render_session_average_unit_empty(client):

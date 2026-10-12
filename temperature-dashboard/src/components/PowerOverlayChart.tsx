@@ -62,9 +62,10 @@ interface Props {
   onZoomWindow?: (win: { startS: number; endS: number } | null) => void;
   /**
    * Aktuelles Zoom-Fenster (Mirror des App-State). Nötig für den Sync nach
-   * dem Zoom-Nachladen: Der Server liefert die Daten dann FENSTERRELATIV
-   * (0-basiert), der Zoom-Zustand des Charts bleibt aber absolut -> ohne
-   * Sync zeigt der Chart ins Leere und "Zoom in die Mitte" wirkt kaputt.
+   * dem Zoom-Nachladen: Der Server liefert die Daten in ABSOLUTEN
+   * Koordinaten (Sekunden seit Zyklusanfang, kein Rebasieren), der Sicht-
+   * bereich des Charts wird programmatisch aufs Fenster gesetzt, damit die
+   * Achse nach dem Nachladen exakt an der gleichen Position bleibt.
    */
   zoomWindow?: { startS: number; endS: number } | null;
 }
@@ -77,17 +78,13 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
   // dem Nachladen). Der programmatische Zoom feuert onZoomComplete -> ohne
   // Flag wuerde das erneut ein Nachladen (Endlosschleife) triggern.
   const suppressReportRef = useRef(false);
-  // Ref-Mirror von zoomWindow: Die zoom/pan-Callbacks brauchen das AKTUELLE
-  // Fenster (Absolutstart), ohne von Render-Reihenfolgen abhaengig zu sein.
-  const zoomWindowRef = useRef(zoomWindow);
-  zoomWindowRef.current = zoomWindow;
 
   /**
-   * Sync nach dem Zoom-Nachladen: Der Server liefert die Daten FENSTERRELATIV
-   * (0-basiert, siehe zoomWindow-Doc), der Chart-Zustand bleibt aber beim
-   * absoluten Zoomfenster stehen. Deshalb: Sichtbereich programmatisch auf
-   * das neue Fenster setzen (0 .. Fensterspanne). Wird bei jedem Daten-Update
-   * ausgefuehrt, wenn ein Fenster aktiv ist.
+   * Sync nach dem Zoom-Nachladen: Sichtbereich programmatisch auf das
+   * ABSOLUTE Fenster setzen. Die Daten kommen fenstergeschnitten, aber in
+   * absoluten Koordinaten (kein Rebasieren auf 0) - dadurch bleibt die
+   * Achse an der echten Position (linke Kante zeigt die echte Fensterzeit,
+   * Pan verschiebt die Kurve sichtbar statt ins Leere).
    */
   useEffect(() => {
     const chart = chartRef.current;
@@ -97,12 +94,15 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
       chart.resetZoom?.();
       return;
     }
-    const span = Math.max(zoomWindow.endS - zoomWindow.startS, 1e-3);
     suppressReportRef.current = true;
     try {
       // Der Sync-Effekt laeuft NACH dem Daten-Update (chartData-Memo),
-      // sodass der neue fensterrelative Datensatz im Chart ist.
-      chart.zoom?.({ x: { min: 0, max: span } }, undefined, { suppressUpdate: false });
+      // sodass der neue Datensatz im Chart ist.
+      chart.zoom?.(
+        { x: { min: zoomWindow.startS, max: zoomWindow.endS } },
+        undefined,
+        { suppressUpdate: false },
+      );
     } finally {
       suppressReportRef.current = false;
     }
@@ -253,12 +253,9 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
             if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
             const x = chart.scales.x;
             zoomDebounceRef.current = setTimeout(() => {
-              // Fensternachladen liefert fensterrelative Daten (0-basiert).
-              // Zurueckgerechnet auf absolute Fensterkoordinaten (Absolutstart
-              // aus dem Ref-Mirror), sonst pannst der naechste Zoom weg.
-              const w = zoomWindowRef.current;
-              const off = w ? w.startS : 0;
-              onZoomWindow?.({ startS: off + x.min, endS: off + x.max });
+              // Daten sind ABSOLUT (kein Rebasieren) -> das sichtbare Fenster
+              // kann direkt gemeldet werden.
+              onZoomWindow?.({ startS: x.min, endS: x.max });
             }, 400);
           },
         },
@@ -270,10 +267,8 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
             if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
             const x = chart.scales.x;
             zoomDebounceRef.current = setTimeout(() => {
-              // Wie onZoomComplete: fensterrelativ -> absolut zurueckrechnen.
-              const w = zoomWindowRef.current;
-              const off = w ? w.startS : 0;
-              onZoomWindow?.({ startS: off + x.min, endS: off + x.max });
+              // Wie onZoomComplete: Daten sind ABSOLUT, Fenster direkt melden.
+              onZoomWindow?.({ startS: x.min, endS: x.max });
             }, 400);
           },
         },

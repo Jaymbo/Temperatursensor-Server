@@ -502,37 +502,20 @@ def _render_overlay_cycles(
         w1 = t1 + 1e-9 if window_end_s is None else t0 + max(window_end_s, 0.0) + 1e-9
         i0 = bisect.bisect_left(ts_all, w0 - 1e-6)
         i1 = bisect.bisect_right(ts_all, w1)
+        # ABSOLUTE Koordinaten (Sekunden seit Zyklusanfang, NICHT auf das
+        # Fenster rebasiert): Der Chart behaelt die echte Achsenposition,
+        # Pan/Zoom fuehlen sich natuerlich an und der linke Rand zeigt die
+        # tatsaechliche Fensterzeit statt klebender 0.
         t_s = [round(samples[i][0] - t0, 4) for i in range(i0, i1)]
         ma = [round(samples[i][1], 4) for i in range(i0, i1)]
-        # Downsampling (Punkte fuer die Darstellung reduzieren, Form/Peaks
-        # bleiben per LTTB erhalten). Bei Zoom-Fenster: absolute t in das
-        # Fenster-relative Koordinatensystem verschieben.
-        if window_start_s is not None:
-            rel = float(window_start_s)
-            t_s = [round(t - rel, 4) for t in t_s]
         if max_points_per_cycle and len(t_s) > max_points_per_cycle:
             keep, _ = _lttb_select(t_s, ma, max_points_per_cycle)
             t_s = [t_s[i] for i in keep]
             ma = [ma[i] for i in keep]
-        # Landmarks/Phasen auf die fensterrelative Achse mitverschieben,
-        # damit Marker im gezoomten Chart mit den (relativ gerenderten)
-        # Datenpunkten uebereinstimmen.
+        # Landmarks/Phasen bleiben (wie die Datenpunkte) in absoluten
+        # fensteruebergreifenden Koordinaten.
         lm_out = c["landmarks"]
         ph_out = c["phases"]
-        if window_start_s is not None:
-            rel = float(window_start_s)
-            lm_out = {
-                name: ({"start_s": round(v["start_s"] - rel, 3)} if v else None)
-                for name, v in lm_out.items()
-            }
-            ph_out = {
-                name: {
-                    "start_s": round(p["start_s"] - rel, 3),
-                    "end_s": round(p["end_s"] - rel, 3),
-                    "duration_s": p["duration_s"],
-                }
-                for name, p in ph_out.items()
-            }
         out.append({
             "start": c["start"],
             "duration_s": c["duration_s"],
@@ -652,23 +635,25 @@ def render_session_average(
             continue
         group = groups[sid][-int(cycle_limit):]
         n = len(group)
-        # Gemeinsames Raster ueber die laengste Dauer im Fenster.
+        # Gemeinsames Raster ueber die laengste Dauer im Fenster. ABSOLUTE
+        # Koordinaten (kein Rebasieren auf 0): hi bleibt an der echten
+        # Fensterposition, der Chart behaelt die Achsenposition beim Zoom.
         max_dur = max((c["duration_s"] for c in group), default=0.0)
         lo = w0 if w0 is not None else 0.0
         hi = min(w1, max_dur) if (w1 is not None and w1 < max_dur) else max_dur
         if hi <= lo:
             continue
-        # Raster fensterrelativ (0-basiert); die Abtastung je Zyklus mappt
-        # auf t0 + lo + g (Absolutzeit im Stream). Punkt-Deckel: bei sehr
-        # langen Zyklen vergroessert sich der Schritt (kein 12k-Punkt-Chart).
+        # Raster in absoluten Fenstergrenzen; die Abtastung je Zyklus mappt
+        # auf t0 + t (Absolutzeit im Stream). Punkt-Deckel: bei sehr langen
+        # Zyklen vergroessert sich der Schritt (kein 12k-Punkt-Chart).
         span = hi - lo
         step = max(step_s, span / max(MAX_AVG_POINTS, 1))
         grid_t = []
-        g = 0.0
-        while g < (hi - lo) - 1e-9:
+        g = lo
+        while g < hi - 1e-9:
             grid_t.append(round(g, 4))
             g += step
-        grid_t.append(round(hi - lo, 4))
+        grid_t.append(round(hi, 4))
 
         # Resampling je Zyklus (Bisect-Schnitt + linear. Interpolation).
         cols: list[list[float]] = []
@@ -680,7 +665,7 @@ def render_session_average(
             cma = [samples[i][1] for i in range(i0, i1)]
             if len(ct) < 2:
                 continue
-            cols.append(_interp_grid(ct, cma, [lo + g for g in grid_t]))
+            cols.append(_interp_grid(ct, cma, list(grid_t)))
 
         if not cols:
             continue
@@ -703,26 +688,12 @@ def render_session_average(
                     var_sums[j] += d * d
             std = [round((vs / (m - 1)) ** 0.5, 3) for vs in var_sums]
 
-        # Landmarks/Phasen aus dem Median-Zyklus (repraesentativ); bei
-        # Zoom-Fenster auf die fensterrelative Achse mitverschieben (wie
-        # _render_overlay_cycles).
+        # Landmarks/Phasen aus dem Median-Zyklus (repraesentativ); bleiben
+        # (wie die Datenpunkte) in absoluten Koordinaten - kein Rebasieren.
         durs = [c["duration_s"] for c in group]
         median_c = group[min(range(n), key=lambda i: abs(durs[i] - statistics.median(durs)))]
         lm = median_c["landmarks"]
         ph = median_c["phases"]
-        if w0 is not None:
-            lm = {
-                name: ({"start_s": round(v["start_s"] - w0, 3)} if v else None)
-                for name, v in lm.items()
-            }
-            ph = {
-                name: {
-                    "start_s": round(p["start_s"] - w0, 3),
-                    "end_s": round(p["end_s"] - w0, 3),
-                    "duration_s": p["duration_s"],
-                }
-                for name, p in ph.items()
-            }
         out.append({
             "session_id": sid,
             "n_cycles": len(cols),
