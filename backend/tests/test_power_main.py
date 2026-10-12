@@ -234,8 +234,9 @@ def test_power_sessions_cycle_has_session_id(client):
 def test_overlay_cache_hit_is_fast_and_fresh(client, monkeypatch):
     """Zweiter Overlay-Request innerhalb der TTL: Cache-Hit, identisches Ergebnis.
 
-    Der Cache-Hit-Pfad enthaelt kein get_power_measurements und keine
-    Vollanalyse - geprueft ueber einen Counter-Mock.
+    Der Cache haelt nur die ANALYSE (RAM-Design), die Rohproben werden je
+    Request frisch geladen. Geprueft ueber einen Counter-Mock: Kein zweiter
+    Vollanalyse-Lauf, aber Rohproben-Abfrage bleibt (bewusst) drin.
     """
     import main as mainmod
     pts = _profile_chain(3)
@@ -255,7 +256,7 @@ def test_overlay_cache_hit_is_fast_and_fresh(client, monkeypatch):
     first = client.get("/power/cycles/7/overlay", params={"mode": "cycles"}).json()
     assert calls["n"] == 1
     second = client.get("/power/cycles/7/overlay", params={"mode": "cycles"}).json()
-    assert calls["n"] == 1  # Cache-Hit: keine erneute Messwert-Abfrage
+    assert calls["n"] == 2  # Rohproben werden je Request frisch geladen
     assert second["cycles"] == first["cycles"]
 
     # Zoom-Fenster auf Cache-Hit rendern (nur Fensterschnitt + LTTB)
@@ -312,6 +313,92 @@ def test_overlay_cache_eviction(client):
         _post_samples(client, f"e{i}", _synthetic_profile())
         client.get(f"/power/cycles/e{i}/overlay", params={"mode": "cycles"}).json()
     assert len(mainmod._overlay_cache) <= 8
+
+
+def test_invalidate_power_caches_on_new_samples(client):
+    """Insert neuer Rohproben leert beide Power-Caches aktiv (RAM-Freigabe)."""
+    import main as mainmod
+    mainmod._overlay_cache.clear()
+    mainmod._session_avg_cache.clear()
+    _post_samples(client, "inv1", _profile_chain(1))
+    client.get("/power/cycles/inv1/overlay", params={"mode": "cycles"}).json()
+    client.get("/power/cycles/inv1/overlay").json()  # avg-Modus
+    assert len(mainmod._overlay_cache) == 1
+    assert len(mainmod._session_avg_cache) == 1
+
+    # Neuer Insert -> Caches muessen geleert sein (nicht nur ungueltig).
+    _post_samples(client, "inv1", _synthetic_profile(offset_s=PROFILE_DURATION_S))
+    assert mainmod._overlay_cache == {}
+    assert mainmod._session_avg_cache == {}
+
+
+def test_overlay_cache_fingerprint_mismatch_recomputes(client):
+    """Fingerprint-Abweichung ohne Insert-Invalidierung -> Pop + Neuberechnung.
+
+    Der Insert-Endpoint leert den Cache aktiv; dieser defensive Pfad (Daten
+    haben sich auf anderem Weg geaendert) wird direkt ueber einen manipulierten
+    Fingerprint geprueft.
+    """
+    import main as mainmod
+    mainmod._overlay_cache.clear()
+    _post_samples(client, "fm1", _profile_chain(1))
+    client.get("/power/cycles/fm1/overlay", params={"mode": "cycles"}).json()
+    assert len(mainmod._overlay_cache) == 1
+    for entry in mainmod._overlay_cache.values():
+        entry["fingerprint"] = ("x", 0)  # abweichend zum echten Fingerprint
+
+    data = client.get("/power/cycles/fm1/overlay", params={"mode": "cycles"}).json()
+    # Pop-Pfad lief: Eintrag neu berechnet (wieder valide, Zyklus erkannt).
+    assert len(data["cycles"]) == 1
+    assert len(mainmod._overlay_cache) == 1
+    for entry in mainmod._overlay_cache.values():
+        assert entry["fingerprint"] != ("x", 0)
+
+
+def test_session_avg_cache_fingerprint_mismatch_recomputes(client):
+    """Wie test_overlay_cache_fingerprint_mismatch_recomputes, avg-Cache."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    _post_samples(client, "fm2", _profile_chain(1))
+    client.get("/power/cycles/fm2/overlay").json()
+    assert len(mainmod._session_avg_cache) == 1
+    for entry in mainmod._session_avg_cache.values():
+        entry["fingerprint"] = ("x", 0)
+
+    data = client.get("/power/cycles/fm2/overlay").json()
+    assert len(data["avg"]) == 1
+    for entry in mainmod._session_avg_cache.values():
+        assert entry["fingerprint"] != ("x", 0)
+
+
+def test_overlay_cache_eviction_on_third_key(client):
+    """Dritter Cache-Key bei Limit 2 -> while-Loop leert den Cache."""
+    import main as mainmod
+    mainmod._overlay_cache.clear()
+    _post_samples(client, "ev1", _synthetic_profile())
+    client.get("/power/cycles/ev1/overlay", params={"mode": "cycles"}).json()
+    # Zwei Keys OHNE Insert dazwischen (Insert wuerde aktiv leeren):
+    client.get("/power/cycles/ev1/overlay",
+               params={"mode": "cycles", "peak_trigger_ma": 200.0}).json()
+    assert len(mainmod._overlay_cache) == 2
+    # Dritter Key -> Eviction (while len >= 2: clear).
+    client.get("/power/cycles/ev1/overlay",
+               params={"mode": "cycles", "peak_trigger_ma": 300.0}).json()
+    assert len(mainmod._overlay_cache) == 1
+
+
+def test_session_avg_cache_eviction_on_third_key(client):
+    """Dritter avg-Cache-Key bei Limit 2 -> Eviction-Clear."""
+    import main as mainmod
+    mainmod._session_avg_cache.clear()
+    _post_samples(client, "ev3", _profile_chain(1))
+    client.get("/power/cycles/ev3/overlay").json()
+    client.get("/power/cycles/ev3/overlay",
+               params={"window_start_s": 0.0, "window_end_s": 5.0}).json()
+    assert len(mainmod._session_avg_cache) == 2
+    client.get("/power/cycles/ev3/overlay",
+               params={"window_start_s": 0.0, "window_end_s": 4.0}).json()
+    assert len(mainmod._session_avg_cache) == 1
 
 
 # ── Overlay mode="avg" (Session-Durchschnitt, Standard-Ansicht) ───────────
@@ -562,17 +649,21 @@ def test_session_avg_cache_ttl_expiry(client):
 
 
 def test_session_avg_cache_eviction(client):
-    """Mehr als 8 Eintraege -> Cache geleert (Groessenbegrenzung)."""
+    """Mehr als _OVERLAY_CACHE_MAX_ENTRIES Eintraege -> Cache geleert."""
     import main as mainmod
     mainmod._session_avg_cache.clear()
-    for i in range(9):
+    for i in range(mainmod._OVERLAY_CACHE_MAX_ENTRIES + 2):
         _post_samples(client, f"f{i}", _profile_chain(1))
         client.get(f"/power/cycles/f{i}/overlay").json()
-    assert len(mainmod._session_avg_cache) <= 8
+    assert len(mainmod._session_avg_cache) <= mainmod._OVERLAY_CACHE_MAX_ENTRIES
 
 
 def test_session_avg_cache_different_keys(client):
-    """Verschiedene Session-Filter/Fenster fuehren zu separaten Eintraegen."""
+    """Verschiedene Session-Filter/Fenster fuehren zu separaten Eintraegen.
+
+    Bewusst nur 2 Schluessel: _OVERLAY_CACHE_MAX_ENTRIES = 2, ein dritter
+    wuerde den Cache leeren (Eviction, siehe test_session_avg_cache_eviction).
+    """
     import main as mainmod
     mainmod._session_avg_cache.clear()
     created = _create_sessions(client, [("1", None), (None, None)])
@@ -580,6 +671,4 @@ def test_session_avg_cache_different_keys(client):
     client.get("/power/cycles/c4/overlay").json()
     client.get("/power/cycles/c4/overlay",
                params={"session_ids": str(created[0]["id"])}).json()
-    client.get("/power/cycles/c4/overlay",
-               params={"window_start_s": 0.0, "window_end_s": 5.0}).json()
-    assert len(mainmod._session_avg_cache) == 3
+    assert len(mainmod._session_avg_cache) == 2

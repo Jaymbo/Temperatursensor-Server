@@ -1122,6 +1122,10 @@ def add_power_measurements_endpoint(payload: dict):
             "seq": seq_list[i] if i < len(seq_list) else None,
         })
     inserted = add_power_measurements(rows)
+    # Neuer Rohproben -> beide Power-Caches aktiv leeren (RAM + frische
+    # Analyse beim naechsten Request, siehe _invalidate_power_caches).
+    if inserted:
+        _invalidate_power_caches()
     return {"status": "success", "inserted": inserted}
 
 
@@ -1295,7 +1299,15 @@ def power_cycles_overlay_endpoint(
 # Schwellwerte) gecacht; die Gueltigkeit wird ueber eine einzige guenstige
 # SQL-Max-Abfrage geprueft (neueste Probe + Anzahl aendern sich bei neuen
 # Daten). TTL als zweite Schranke gegen sehr haeufige inserts.
+#
+# RAM-Begrenzung (war Ursache fuer 3.8 GB uvicorn-RAM):
+#   * Der Cache haelt NUR die Analyse (kleine Zyklus-Liste), NICHT die
+#     Rohproben. Die Rohproben werden je Request frisch geladen und nach
+#     dem Rendern wieder freigegeben (transiente Spitze statt Dauerlast).
+#   * Max. _OVERLAY_CACHE_MAX_ENTRIES Eintraege; bei neuem Insert werden
+#     beide Caches aktiv geleert (_invalidate_power_caches).
 _OVERLAY_CACHE_TTL_S = 5.0
+_OVERLAY_CACHE_MAX_ENTRIES = 2
 _overlay_cache: dict = {}
 _overlay_cache_lock = threading.Lock()
 
@@ -1319,6 +1331,22 @@ def _power_fingerprint(logger_id: str) -> tuple:
         conn.close()
 
 
+def _invalidate_power_caches() -> None:
+    """
+    Beide Power-Caches aktiv leeren (nach neuen Stromproben).
+
+    Bewusst hart statt per Fingerprint: Neue Rohproben machen sowieso jeden
+    Eintrag ungueltig; das sofortige Freigeben der Analyse-Objekte verhindert,
+    dass RAM zwischen Insert und naechstem Request unnoetig gehalten wird.
+    Aggregate (/power/aggregate) betreffen die Analyse nicht und invalidieren
+    bewusst nicht.
+    """
+    with _overlay_cache_lock:
+        _overlay_cache.clear()
+    with _session_avg_lock:
+        _session_avg_cache.clear()
+
+
 def _get_cached_power_analysis(
     logger_id: str,
     since: str | None,
@@ -1326,11 +1354,13 @@ def _get_cached_power_analysis(
     kwargs: dict,
 ) -> tuple[dict, list]:
     """
-    Vollanalyse + Rohproben fuer den Overlay-Endpoint, gecacht.
+    Vollanalyse fuer den Overlay-Endpoint, gecacht.
 
-    Bei Cache-Hit entfaellt sowohl das Laden der Rohproben als auch die
-    Vollanalyse - das Zoom-Nachladen rendert dann nur noch das Fenster
-    (ms-Bereich).
+    RAM-Design (siehe Cache-Kommentar oben): Nur die ANALYSE wird gehalten,
+    die Rohproben NICHT - sie werden je Request frisch geladen. Bei Cache-Hit
+    entfaellt damit zwar nicht das Laden der Rohproben, wohl aber die teure
+    Vollanalyse (Zoom-Nachladen bleibt trotzdem im ms-Bereich: das Laden ist
+    ein einzelner indizierter SQL-Scan, das Rendern nur Bisect + LTTB).
     """
     key = _power_cache_key(logger_id, since, limit, kwargs)
     now = time.monotonic()
@@ -1345,7 +1375,11 @@ def _get_cached_power_analysis(
         if _power_fingerprint(logger_id) == cached_fp:
             with _overlay_cache_lock:
                 entry["ts"] = now  # TTL verlaengern
-            return entry["analysis"], entry["samples"]
+            # Rohproben frisch laden (bewusst NICHT gecacht, siehe oben).
+            measurements = get_power_measurements(logger_id, since=since,
+                                                  limit=limit)
+            samples = power_cycles._prepare_samples(measurements)
+            return entry["analysis"], samples
         # Daten haben sich geaendert -> neu berechnen.
         with _overlay_cache_lock:
             _overlay_cache.pop(key, None)
@@ -1360,14 +1394,15 @@ def _get_cached_power_analysis(
     analysis = power_cycles.analyze_cycles_from_samples(
         samples, t_base_iso=t_base_iso.isoformat() if t_base_iso else None, **kwargs)
     with _overlay_cache_lock:
-        # Cache begrenzen (verschiedene logger/Schwellwert-Kombis).
-        if len(_overlay_cache) >= 8:
+        # Cache begrenzen (verschiedene logger/Schwellwert-Kombis). Kleine
+        # Grenze, weil ein Eintrag zwar nur die Analyse haelt, aber die
+        # Fingerprint/TTL-Logik mit vielen Eintraegen unnoetig RAM bindet.
+        while len(_overlay_cache) >= _OVERLAY_CACHE_MAX_ENTRIES:
             _overlay_cache.clear()
         _overlay_cache[key] = {
             "ts": now,
             "fingerprint": _power_fingerprint(logger_id),
             "analysis": analysis,
-            "samples": samples,
         }
     return analysis, samples
 
@@ -1434,7 +1469,7 @@ def _get_cached_session_average(
         window_start_s=window_start_s, window_end_s=window_end_s,
     )
     with _session_avg_lock:
-        if len(_session_avg_cache) >= 8:
+        if len(_session_avg_cache) >= _OVERLAY_CACHE_MAX_ENTRIES:
             _session_avg_cache.clear()
         _session_avg_cache[key] = {
             "ts": now,
