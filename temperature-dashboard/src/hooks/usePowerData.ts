@@ -115,5 +115,31 @@ export const usePowerData = () => {
     }
   }, []);
 
-  return { loggers, cycles, stats, sessions, isLoading, error, loadLoggers, loadCycles };
+  /**
+   * Nur das Overlay nachladen (Zoom-Nachladen in voller Aufloesung bzw.
+   * Reset auf die Gesamtansicht). Bewusst OHNE /power/cycles und
+   * /power/sessions: Die Statistik aendert sich beim Zoomen nicht und deren
+   * Vollanalyse wuerde das Nachladen unnötig verlangsamen.
+   */
+  const loadOverlay = useCallback(async (loggerId: string,
+                                         window?: { startS: number; endS: number },
+                                         maxPointsPerCycle = 500,
+                                         overlayLimit = 20) => {
+    setError(null);
+    try {
+      const winParams = window
+        ? `&window_start_s=${window.startS}&window_end_s=${window.endS}`
+        : "";
+      const res = await fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}` +
+        `&max_points_per_cycle=${maxPointsPerCycle}${winParams}`));
+      if (!res.ok) throw new Error("Fehler beim Laden des Overlays.");
+      const overlay = await res.json();
+      setCycles(overlay.cycles || []);
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Laden des Overlays.");
+    }
+  }, []);
+
+  return { loggers, cycles, stats, sessions, isLoading, error, loadLoggers, loadCycles, loadOverlay };
 };

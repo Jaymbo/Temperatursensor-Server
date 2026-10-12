@@ -28,6 +28,7 @@ jederzeit aenderbar.
 
 from __future__ import annotations
 
+import bisect
 import datetime
 import statistics
 
@@ -198,37 +199,31 @@ def extract_landmarks(
     return out
 
 
-def analyze_cycles(
-    measurements: list[dict],
+def analyze_cycles_from_samples(
+    samples: list[tuple[float, float]],
     peak_trigger_ma: float = DEFAULT_PEAK_TRIGGER_MA,
     pre_peak_s: float = DEFAULT_PRE_PEAK_S,
     refractory_s: float = DEFAULT_REFRACTORY_S,
     spike_end_ma: float = DEFAULT_SPIKE_END_MA,
     max_cycle_s: float = DEFAULT_MAX_CYCLE_S,
     gap_s: float = DEFAULT_GAP_S,
+    t_base_iso: str | None = None,
 ) -> dict:
     """
-    Vollanalyse: Segmentierung + Landmarks + Phasen-Dauern je Zyklus.
+    Vollanalyse aus bereits aufbereiteten Samples (siehe _prepare_samples).
 
-    @return {"cycles": [...], "stats": {...}} mit
-      cycle = {
-        "start": ISO des Zyklusanfangs (Trigger - pre_peak_s),
-        "duration_s": ..., "peak_ma": ..., "charge_uah": ...,
-        "truncated": ..., "gap": ...,
-        "landmarks": {name: {"start_s": ...} | None},
-        "phases": {name: {"start_s": ..., "end_s": ..., "duration_s": ...}},
-      }
-      stats = je Phase min/median/max der Dauer ueber alle vollstaendigen Zyklen
+    Von analyze_cycles getrennt, damit der Overlay-Cache die Analyse ohne
+    erneutes ISO-Parsen/Laden der Rohproben aufrufen kann.
+
+    @return {"cycles": [...], "stats": {...}} (gleiche Struktur wie
+            analyze_cycles)
     """
-    samples = _prepare_samples(measurements)
     if not samples:
         return {"cycles": [], "stats": {}}
 
-    t_base_iso = None
-    for m in measurements:
-        t_base_iso = _parse_iso(m.get("measured_at"))
-        if t_base_iso is not None:
-            break
+    # Akzeptiert ISO-String oder datetime; normiert auf datetime.
+    t_base = (t_base_iso if isinstance(t_base_iso, datetime.datetime)
+              else _parse_iso(t_base_iso))
 
     segments = segment_cycles(samples, peak_trigger_ma, pre_peak_s, refractory_s,
                               max_cycle_s, gap_s)
@@ -267,8 +262,8 @@ def analyze_cycles(
         }
 
         start_iso = None
-        if t_base_iso is not None:
-            start_iso = (t_base_iso + datetime.timedelta(seconds=t0)).isoformat()
+        if t_base is not None:
+            start_iso = (t_base + datetime.timedelta(seconds=t0)).isoformat()
 
         cycles.append({
             "start": start_iso,
@@ -312,6 +307,40 @@ def analyze_cycles(
             "max_s": round(max(c["duration_s"] for c in full), 3),
         }
     return {"cycles": cycles, "stats": stats}
+
+
+def analyze_cycles(
+    measurements: list[dict],
+    peak_trigger_ma: float = DEFAULT_PEAK_TRIGGER_MA,
+    pre_peak_s: float = DEFAULT_PRE_PEAK_S,
+    refractory_s: float = DEFAULT_REFRACTORY_S,
+    spike_end_ma: float = DEFAULT_SPIKE_END_MA,
+    max_cycle_s: float = DEFAULT_MAX_CYCLE_S,
+    gap_s: float = DEFAULT_GAP_S,
+) -> dict:
+    """
+    Vollanalyse: Segmentierung + Landmarks + Phasen-Dauern je Zyklus.
+
+    @return {"cycles": [...], "stats": {...}} mit
+      cycle = {
+        "start": ISO des Zyklusanfangs (Trigger - pre_peak_s),
+        "duration_s": ..., "peak_ma": ..., "charge_uah": ...,
+        "truncated": ..., "gap": ...,
+        "landmarks": {name: {"start_s": ...} | None},
+        "phases": {name: {"start_s": ..., "end_s": ..., "duration_s": ...}},
+      }
+      stats = je Phase min/median/max der Dauer ueber alle vollstaendigen Zyklen
+    """
+    samples = _prepare_samples(measurements)
+    t_base_iso = None
+    for m in measurements:
+        t_base_iso = _parse_iso(m.get("measured_at"))
+        if t_base_iso is not None:
+            break
+    return analyze_cycles_from_samples(
+        samples, peak_trigger_ma=peak_trigger_ma, pre_peak_s=pre_peak_s,
+        refractory_s=refractory_s, spike_end_ma=spike_end_ma,
+        max_cycle_s=max_cycle_s, gap_s=gap_s, t_base_iso=t_base_iso)
 
 
 def assign_sessions_to_cycles(
@@ -444,6 +473,80 @@ def _lttb_select(t_s: list[float], ma: list[float], target_n: int) -> tuple[list
     return selected, len(selected)
 
 
+def _render_overlay_cycles(
+    analysis: dict,
+    samples: list[tuple[float, float]],
+    limit: int = 20,
+    window_start_s: float | None = None,
+    window_end_s: float | None = None,
+    max_points_per_cycle: int = DEFAULT_MAX_POINTS_PER_CYCLE,
+) -> list[dict]:
+    """
+    Overlay-Zyklen aus voraufbereiteter Analyse + Rohproben rendern.
+
+    Getrennt von build_overlay, damit der teure Teil (Vollanalyse ueber alle
+    Proben) gecacht werden kann und beim Zoom-Nachladen nur der Fenster-
+    Schnitt (Bisect, O(log n + k)) neu laeuft.
+    """
+    # Sortierte Zeitachse einmalig fuer den Bisect-Fensterschnitt.
+    ts_all = [t for t, _ in samples]
+    out = []
+    for c in analysis["cycles"][-int(limit):]:
+        # Zugehoerige Rohproben: ueber t0_s und Dauer aus dem Stream schneiden.
+        t0 = c["t0_s"]
+        t1 = t0 + c["duration_s"]
+        # Zoom-Fenster anwenden (Achse: Sekunden seit Zyklusanfang).
+        # Epsilon 1e-6: Rand-Samples trotz Fließkomma-Drift aus ISO->s
+        # (datetime.total_seconds) nicht versehentlich verwerfen.
+        w0 = t0 + (window_start_s if window_start_s is not None else 0.0)
+        w1 = t1 + 1e-9 if window_end_s is None else t0 + max(window_end_s, 0.0) + 1e-9
+        i0 = bisect.bisect_left(ts_all, w0 - 1e-6)
+        i1 = bisect.bisect_right(ts_all, w1)
+        t_s = [round(samples[i][0] - t0, 4) for i in range(i0, i1)]
+        ma = [round(samples[i][1], 4) for i in range(i0, i1)]
+        # Downsampling (Punkte fuer die Darstellung reduzieren, Form/Peaks
+        # bleiben per LTTB erhalten). Bei Zoom-Fenster: absolute t in das
+        # Fenster-relative Koordinatensystem verschieben.
+        if window_start_s is not None:
+            rel = float(window_start_s)
+            t_s = [round(t - rel, 4) for t in t_s]
+        if max_points_per_cycle and len(t_s) > max_points_per_cycle:
+            keep, _ = _lttb_select(t_s, ma, max_points_per_cycle)
+            t_s = [t_s[i] for i in keep]
+            ma = [ma[i] for i in keep]
+        # Landmarks/Phasen auf die fensterrelative Achse mitverschieben,
+        # damit Marker im gezoomten Chart mit den (relativ gerenderten)
+        # Datenpunkten uebereinstimmen.
+        lm_out = c["landmarks"]
+        ph_out = c["phases"]
+        if window_start_s is not None:
+            rel = float(window_start_s)
+            lm_out = {
+                name: ({"start_s": round(v["start_s"] - rel, 3)} if v else None)
+                for name, v in lm_out.items()
+            }
+            ph_out = {
+                name: {
+                    "start_s": round(p["start_s"] - rel, 3),
+                    "end_s": round(p["end_s"] - rel, 3),
+                    "duration_s": p["duration_s"],
+                }
+                for name, p in ph_out.items()
+            }
+        out.append({
+            "start": c["start"],
+            "duration_s": c["duration_s"],
+            "peak_ma": c["peak_ma"],
+            "truncated": c["truncated"],
+            "gap": c["gap"],
+            "landmarks": lm_out,
+            "phases": ph_out,
+            "t_s": t_s,
+            "ma": ma,
+        })
+    return out
+
+
 def build_overlay(
     measurements: list[dict],
     limit: int = 20,
@@ -467,44 +570,11 @@ def build_overlay(
     """
     analysis = analyze_cycles(measurements, **kwargs)
     samples = _prepare_samples(measurements)
-    out = []
-    for c in analysis["cycles"][-int(limit):]:
-        # Zugehoerige Rohproben: ueber t0_s und Dauer aus dem Stream schneiden.
-        t0 = c["t0_s"]
-        t1 = t0 + c["duration_s"]
-        # Zoom-Fenster anwenden (Achse: Sekunden seit Zyklusanfang).
-        # Epsilon 1e-6: Rand-Samples trotz Fließkomma-Drift aus ISO->s
-        # (datetime.total_seconds) nicht versehentlich verwerfen.
-        w0 = t0 + (window_start_s if window_start_s is not None else 0.0)
-        w1 = t1 + 1e-9 if window_end_s is None else t0 + max(window_end_s, 0.0) + 1e-9
-        t_s: list[float] = []
-        ma: list[float] = []
-        for t, cur in samples:
-            if t < w0 - 1e-6:
-                continue
-            if t > w1:
-                break
-            t_s.append(round(t - t0, 4))
-            ma.append(round(cur, 4))
-        # Downsampling (Punkte fuer die Darstellung reduzieren, Form/Peaks
-        # bleiben per LTTB erhalten). Bei Zoom-Fenster: absolute t in das
-        # Fenster-relative Koordinatensystem verschieben.
-        if window_start_s is not None:
-            rel = float(window_start_s)
-            t_s = [round(t - rel, 4) for t in t_s]
-        if max_points_per_cycle and len(t_s) > max_points_per_cycle:
-            keep, _ = _lttb_select(t_s, ma, max_points_per_cycle)
-            t_s = [t_s[i] for i in keep]
-            ma = [ma[i] for i in keep]
-        out.append({
-            "start": c["start"],
-            "duration_s": c["duration_s"],
-            "peak_ma": c["peak_ma"],
-            "truncated": c["truncated"],
-            "gap": c["gap"],
-            "landmarks": c["landmarks"],
-            "phases": c["phases"],
-            "t_s": t_s,
-            "ma": ma,
-        })
-    return {"cycles": out, "stats": analysis["stats"]}
+    return {
+        "cycles": _render_overlay_cycles(
+            analysis, samples, limit=limit,
+            window_start_s=window_start_s, window_end_s=window_end_s,
+            max_points_per_cycle=max_points_per_cycle,
+        ),
+        "stats": analysis["stats"],
+    }

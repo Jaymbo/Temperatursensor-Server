@@ -28,6 +28,9 @@ import battery_health
 from typing import List, Dict
 import json
 import datetime
+import sqlite3
+import threading
+import time
 
 app = FastAPI()
 # uvicorn main:app --reload --host 0.0.0.0 --port 8000
@@ -1226,11 +1229,100 @@ def power_cycles_overlay_endpoint(
     # Wichtig: fuer die Overlay-Ansicht die VOLLSTAENDIGEN Rohdaten nehmen,
     # damit die letzten Zyklen nicht durch ein kleines Daten-Limit beschnitten
     # werden (limit ist hier bewusst nur ein Analyse-Deckel).
-    measurements = get_power_measurements(logger_id, since=since, limit=limit)
     kwargs = _power_cycle_kwargs(peak_trigger_ma, pre_peak_s, refractory_s,
                                  spike_end_ma, max_cycle_s, gap_s)
-    return power_cycles.build_overlay(
-        measurements, limit=overlay_limit,
-        window_start_s=window_start_s, window_end_s=window_end_s,
-        max_points_per_cycle=max_points_per_cycle, **kwargs,
-    )
+    analysis, samples = _get_cached_power_analysis(
+        logger_id, since=since, limit=limit, kwargs=kwargs)
+    return {
+        "cycles": power_cycles._render_overlay_cycles(
+            analysis, samples, limit=overlay_limit,
+            window_start_s=window_start_s, window_end_s=window_end_s,
+            max_points_per_cycle=max_points_per_cycle,
+        ),
+        "stats": analysis["stats"],
+    }
+
+
+# --- Overlay-Analyse-Cache ---------------------------------------------------
+#
+# Das Zoom-Nachladen soll im ms-Bereich antworten. Der teure Teil ist NICHT
+# das Rendern des Fensters (Bisect + LTTB, wenige ms), sondern die Voll-
+# analyse ueber ~500k Rohproben. Diese wird pro (logger, since, limit,
+# Schwellwerte) gecacht; die Gueltigkeit wird ueber eine einzige guenstige
+# SQL-Max-Abfrage geprueft (neueste Probe + Anzahl aendern sich bei neuen
+# Daten). TTL als zweite Schranke gegen sehr haeufige inserts.
+_OVERLAY_CACHE_TTL_S = 5.0
+_overlay_cache: dict = {}
+_overlay_cache_lock = threading.Lock()
+
+
+def _power_cache_key(logger_id: str, since: str | None, limit: int | None,
+                     kwargs: dict) -> tuple:
+    return (logger_id, since, limit,
+            tuple(sorted((k, v) for k, v in kwargs.items())))
+
+
+def _power_fingerprint(logger_id: str) -> tuple:
+    """Guenstige Gueltigkeits-Pruefung: neueste Probe + Zeilenanzahl."""
+    conn = sqlite3.connect(db.DB_PATH, timeout=db.DB_TIMEOUT_S)
+    try:
+        row = conn.execute(
+            "SELECT MAX(measured_at), COUNT(*) FROM power_measurements "
+            "WHERE logger_id = ?", (logger_id,)
+        ).fetchone()
+        return (row[0], row[1])
+    finally:
+        conn.close()
+
+
+def _get_cached_power_analysis(
+    logger_id: str,
+    since: str | None,
+    limit: int | None,
+    kwargs: dict,
+) -> tuple[dict, list]:
+    """
+    Vollanalyse + Rohproben fuer den Overlay-Endpoint, gecacht.
+
+    Bei Cache-Hit entfaellt sowohl das Laden der Rohproben als auch die
+    Vollanalyse - das Zoom-Nachladen rendert dann nur noch das Fenster
+    (ms-Bereich).
+    """
+    key = _power_cache_key(logger_id, since, limit, kwargs)
+    now = time.monotonic()
+    with _overlay_cache_lock:
+        entry = _overlay_cache.get(key)
+        if entry is not None and now - entry["ts"] < _OVERLAY_CACHE_TTL_S:
+            cached_fp = entry["fingerprint"]
+        else:
+            cached_fp = None
+
+    if cached_fp is not None:
+        if _power_fingerprint(logger_id) == cached_fp:
+            with _overlay_cache_lock:
+                entry["ts"] = now  # TTL verlaengern
+            return entry["analysis"], entry["samples"]
+        # Daten haben sich geaendert -> neu berechnen.
+        with _overlay_cache_lock:
+            _overlay_cache.pop(key, None)
+
+    measurements = get_power_measurements(logger_id, since=since, limit=limit)
+    samples = power_cycles._prepare_samples(measurements)
+    t_base_iso = None
+    for m in measurements:
+        t_base_iso = power_cycles._parse_iso(m.get("measured_at"))
+        if t_base_iso is not None:
+            break
+    analysis = power_cycles.analyze_cycles_from_samples(
+        samples, t_base_iso=t_base_iso.isoformat() if t_base_iso else None, **kwargs)
+    with _overlay_cache_lock:
+        # Cache begrenzen (verschiedene logger/Schwellwert-Kombis).
+        if len(_overlay_cache) >= 8:
+            _overlay_cache.clear()
+        _overlay_cache[key] = {
+            "ts": now,
+            "fingerprint": _power_fingerprint(logger_id),
+            "analysis": analysis,
+            "samples": samples,
+        }
+    return analysis, samples

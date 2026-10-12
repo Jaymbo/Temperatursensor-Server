@@ -284,8 +284,9 @@ class TestOverlayDownsampling:
         assert max(full_gaps) > 0.01  # verdichtet
         # Fenster relativ zum Fensteranfang (4.0 s): erste Koordinate ~0.
         assert wc["t_s"][0] == pytest.approx(0.0, abs=0.01)
-        # Trigger liegt jetzt bei 5.0 - 4.0 = 1.0 s
-        assert wc["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.01)
+        # Trigger liegt fensterrelativ bei 5.0 - 4.0 = 1.0 s (wie die
+        # Datenpunkte, die ebenfalls auf 4.0 s verschoben werden).
+        assert wc["landmarks"]["trigger"]["start_s"] == pytest.approx(1.0, abs=0.01)
 
     def test_overlay_window_without_downsampling(self):
         pts = _synthetic_profile(0.8)

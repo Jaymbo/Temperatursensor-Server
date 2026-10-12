@@ -227,3 +227,88 @@ def test_power_sessions_cycle_has_session_id(client):
     assert data["cycles"][0]["session_id"] is None
     assert data["sessions"][0]["session_id"] is None
     assert data["sessions"][0]["n_cycles"] == 1
+
+
+# ── Overlay-Analyse-Cache (Zoom-Nachladen im ms-Bereich) ─────────────────
+
+def test_overlay_cache_hit_is_fast_and_fresh(client, monkeypatch):
+    """Zweiter Overlay-Request innerhalb der TTL: Cache-Hit, identisches Ergebnis.
+
+    Der Cache-Hit-Pfad enthaelt kein get_power_measurements und keine
+    Vollanalyse - geprueft ueber einen Counter-Mock.
+    """
+    import main as mainmod
+    pts = _profile_chain(3)
+    _post_samples(client, "7", pts)
+
+    calls = {"n": 0}
+    orig = mainmod.get_power_measurements
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(mainmod, "get_power_measurements", counting)
+    # Cache leeren (globales Dict), damit der Test deterministisch ist
+    mainmod._overlay_cache.clear()
+
+    first = client.get("/power/cycles/7/overlay").json()
+    assert calls["n"] == 1
+    second = client.get("/power/cycles/7/overlay").json()
+    assert calls["n"] == 1  # Cache-Hit: keine erneute Messwert-Abfrage
+    assert second["cycles"] == first["cycles"]
+
+    # Zoom-Fenster auf Cache-Hit rendern (nur Fensterschnitt + LTTB)
+    win = client.get("/power/cycles/7/overlay",
+                     params={"window_start_s": 4.0, "window_end_s": 6.0}).json()
+    assert win["cycles"][0]["t_s"][0] == 0.0
+    assert win["cycles"][0]["landmarks"]["trigger"]["start_s"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_overlay_cache_invalidated_on_new_data(client):
+    """Neue Proben innerhalb der TTL -> Fingerprint aendert sich -> Neuberechnung."""
+    import main as mainmod
+    mainmod._overlay_cache.clear()
+    _post_samples(client, "8", _synthetic_profile())
+    first = client.get("/power/cycles/8/overlay").json()
+    assert len(first["cycles"]) == 1
+
+    # Neue Proben anhaengen -> zweiter Zyklus -> Cache muss aktualisieren
+    pts = _synthetic_profile()
+    offset = 10.0
+    _post_samples(client, "8", [(t + offset, ma) for t, ma in pts])
+    second = client.get("/power/cycles/8/overlay").json()
+    assert len(second["cycles"]) == 2
+
+
+def test_overlay_cache_ttl_expiry(client, monkeypatch):
+    """TTL abgelaufen -> Fingerprint wird geprueft, bei Gleichheit weiterverwendet."""
+    import main as mainmod
+    mainmod._overlay_cache.clear()
+    _post_samples(client, "9", _synthetic_profile())
+    client.get("/power/cycles/9/overlay").json()
+
+    # TTL kuenstlich ablaufen lassen: ts zuruecksetzen
+    for entry in mainmod._overlay_cache.values():
+        entry["ts"] -= mainmod._OVERLAY_CACHE_TTL_S + 1.0
+
+    # Fingerprint gleich -> Cache wird trotzdem weiterverwendet (Abfrage ok)
+    data = client.get("/power/cycles/9/overlay").json()
+    assert len(data["cycles"]) == 1
+
+
+def test_power_fingerprint_none_logger(client):
+    """Fingerprint fuer unbekannten Logger -> (None, 0)."""
+    import main as mainmod
+    fp = mainmod._power_fingerprint("gibtsnicht")
+    assert fp == (None, 0)
+
+
+def test_overlay_cache_eviction(client):
+    """Mehr als 8 Eintraege -> Cache wird geleert (Groessenbegrenzung)."""
+    import main as mainmod
+    mainmod._overlay_cache.clear()
+    for i in range(9):
+        _post_samples(client, f"e{i}", _synthetic_profile())
+        client.get(f"/power/cycles/e{i}/overlay").json()
+    assert len(mainmod._overlay_cache) <= 8

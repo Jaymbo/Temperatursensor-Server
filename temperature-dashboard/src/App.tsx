@@ -93,9 +93,11 @@ function App() {
   }, [powerLogger]);
 
   // Zoom-Fenster geaendert -> Overlay-Ausschnitt in voller Aufloesung nachladen.
+  // Nur das Overlay (loadOverlay), nicht die Statistik - die aendert sich beim
+  // Zoomen nicht und deren Vollanalyse wuerde das Nachladen verlangsamen.
   useEffect(() => {
     if (!powerLogger) return;
-    power.loadCycles(powerLogger, 20, powerZoomWindow ?? undefined,
+    power.loadOverlay(powerLogger, powerZoomWindow ?? undefined,
       powerZoomWindow ? 5000 : 500);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [powerZoomWindow]);
