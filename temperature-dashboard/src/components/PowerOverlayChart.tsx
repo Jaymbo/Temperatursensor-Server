@@ -61,11 +61,11 @@ interface Props {
    */
   onZoomWindow?: (win: { startS: number; endS: number } | null) => void;
   /**
-   * Aktuelles Zoom-Fenster (Mirror des App-State). Nötig für den Sync nach
-   * dem Zoom-Nachladen: Der Server liefert die Daten in ABSOLUTEN
-   * Koordinaten (Sekunden seit Zyklusanfang, kein Rebasieren), der Sicht-
-   * bereich des Charts wird programmatisch aufs Fenster gesetzt, damit die
-   * Achse nach dem Nachladen exakt an der gleichen Position bleibt.
+   * Aktuelles Zoom-Fenster (Mirror des App-State). Treibt die x-Skala
+   * DIREKT über die Chart-Options (min/max) statt über die imperative
+   * zoom-API: Nach dem Zoom-Nachladen wird der Datensatz ausgetauscht,
+   * aber die Skala bleibt optionsseitig fixiert -> kein sichtbares
+   * Springen (zuerst Gesamtansicht, dann programmatischer Zoom).
    */
   zoomWindow?: { startS: number; endS: number } | null;
 }
@@ -74,39 +74,6 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
   const avg = avgProp ?? [];
   const chartRef = useRef<any>(null);
   const zoomDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // true, waehrend der Sichtbereich PROGRAMMATISCH gesetzt wird (Sync nach
-  // dem Nachladen). Der programmatische Zoom feuert onZoomComplete -> ohne
-  // Flag wuerde das erneut ein Nachladen (Endlosschleife) triggern.
-  const suppressReportRef = useRef(false);
-
-  /**
-   * Sync nach dem Zoom-Nachladen: Sichtbereich programmatisch auf das
-   * ABSOLUTE Fenster setzen. Die Daten kommen fenstergeschnitten, aber in
-   * absoluten Koordinaten (kein Rebasieren auf 0) - dadurch bleibt die
-   * Achse an der echten Position (linke Kante zeigt die echte Fensterzeit,
-   * Pan verschiebt die Kurve sichtbar statt ins Leere).
-   */
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart) return;
-    if (!zoomWindow) {
-      // Zoom zurueckgesetzt: Gesamtansicht wiederherstellen.
-      chart.resetZoom?.();
-      return;
-    }
-    suppressReportRef.current = true;
-    try {
-      // Der Sync-Effekt laeuft NACH dem Daten-Update (chartData-Memo),
-      // sodass der neue Datensatz im Chart ist.
-      chart.zoom?.(
-        { x: { min: zoomWindow.startS, max: zoomWindow.endS } },
-        undefined,
-        { suppressUpdate: false },
-      );
-    } finally {
-      suppressReportRef.current = false;
-    }
-  }, [cycles, avg, zoomWindow]);
 
   // Esc = Zoom zuruecksetzen (wie im Haupt-Chart) -> uebersichtliche Ansicht.
   useEffect(() => {
@@ -226,8 +193,11 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
       x: {
         type: "linear" as const,
         title: { display: true, text: "Zeit seit Zyklusanfang (s)" },
-        min: 0,
-        max: maxT,
+        // Options-driven: min/max haengen direkt am Zoom-Fenster. Beim
+        // Datennachladen bleibt der Sichtbereich dadurch stabil (kein
+        // Rendern der Gesamtansicht + nachtraeglicher Zoom = Springen).
+        min: zoomWindow?.startS ?? 0,
+        max: zoomWindow?.endS ?? maxT,
       },
       y: {
         title: { display: true, text: "Strom (mA)" },
@@ -249,7 +219,6 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
           // Nach dem Zoom das Fenster melden (debounced, damit schnelles
           // Mausraden nicht jede Stufe nachlaedt).
           onZoomComplete: ({ chart }: any) => {
-            if (suppressReportRef.current) return;
             if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
             const x = chart.scales.x;
             zoomDebounceRef.current = setTimeout(() => {
@@ -263,7 +232,6 @@ export const PowerOverlayChart = ({ cycles, avg: avgProp, height = "45vh", onZoo
           enabled: true,
           mode: "x" as const,
           onPanComplete: ({ chart }: any) => {
-            if (suppressReportRef.current) return;
             if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
             const x = chart.scales.x;
             zoomDebounceRef.current = setTimeout(() => {

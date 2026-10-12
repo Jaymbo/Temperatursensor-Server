@@ -581,6 +581,14 @@ DEFAULT_AVG_CYCLE_LIMIT = 200
 # (Render-Last Backend + Chart-Frontend).
 MAX_AVG_POINTS = 600
 
+# Zoom-Fenster: Das Raster darf bis auf die Sample-Aufloesung (5 ms @ 200 Hz)
+# feinern - sonst bleibt ein tief gezoomter Ausschnitt bei 20 ms stehen und
+# Detail (Burst-Kanten, Spitzen) fehlt. Ohne Fenster gilt der 20-ms-Deckel.
+MIN_AVG_STEP_S = 0.005
+# Erhoehter Punkt-Deckel im Zoom-Fenster (kleiner Zeitraum -> mehr Punkte
+# pro Sekunde sind vertretbar; Chart rendert das Fenstergeschnitte gut).
+MAX_AVG_POINTS_ZOOM = 2400
+
 
 def render_session_average(
     analysis: dict,
@@ -647,7 +655,16 @@ def render_session_average(
         # auf t0 + t (Absolutzeit im Stream). Punkt-Deckel: bei sehr langen
         # Zyklen vergroessert sich der Schritt (kein 12k-Punkt-Chart).
         span = hi - lo
-        step = max(step_s, span / max(MAX_AVG_POINTS, 1))
+        if w0 is not None or w1 is not None:
+            # Zoom-Fenster: Raster darf bis zur Sample-Aufloesung feinern
+            # (MIN_AVG_STEP_S), sonst fehlen Burst-Kanten/Spitzen im tief
+            # gezoomten Ausschnitt. step_s (20-ms-Default des Clients)
+            # blockiert hier bewusst NICHT - der Deckel ist der groessere
+            # Punkt-Budget MAX_AVG_POINTS_ZOOM ueber den kleineren
+            # Fensterzeitraum.
+            step = max(MIN_AVG_STEP_S, span / MAX_AVG_POINTS_ZOOM)
+        else:
+            step = max(step_s, span / max(MAX_AVG_POINTS, 1))
         grid_t = []
         g = lo
         while g < hi - 1e-9:

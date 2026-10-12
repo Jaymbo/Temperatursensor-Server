@@ -495,9 +495,43 @@ def test_overlay_avg_mode_window(client):
     # ABSOLUTE Koordinaten: Raster laeuft 4.0 .. 6.0 (kein Rebasieren auf 0).
     assert s["t_s"][0] == pytest.approx(4.0, abs=0.01)
     assert s["t_s"][-1] == pytest.approx(6.0, abs=0.05)
-    assert len(s["t_s"]) < 150  # 2 s / 20 ms ~ 100 Punkte
+    # 2 s Fenster @ 5 ms Raster (MIN_AVG_STEP_S) ~ 400 Punkte.
+    assert 200 <= len(s["t_s"]) <= 401
     # Trigger bleibt absolut bei 5.0 s
     assert s["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.05)
+
+
+def test_render_session_average_zoom_fine_raster(client):
+    """Zoom-Fenster: Raster feinert bis MIN_AVG_STEP_S (5 ms) auf, aber der
+    Punkt-Deckel MAX_AVG_POINTS_ZOOM (2400) greift bei grossen Fenstern."""
+    import datetime as dt
+    pts = _profile_chain(2)
+    base = dt.datetime(2026, 10, 12, 12, 0, 0)
+    m = [{"measured_at": (base + dt.timedelta(seconds=t)).isoformat(),
+          "current_ma": ma} for t, ma in pts]
+    analysis = power_cycles.analyze_cycles(m)
+    samples = power_cycles._prepare_samples(m)
+
+    # 1. Kleines Fenster (0.2 s): 5-ms-Raster -> ~41 Punkte.
+    out = power_cycles.render_session_average(
+        analysis, samples, window_start_s=5.0, window_end_s=5.2)
+    s = out["avg"][0]
+    assert 30 <= len(s["t_s"]) <= 41
+    step = s["t_s"][1] - s["t_s"][0]
+    assert step == pytest.approx(power_cycles.MIN_AVG_STEP_S, abs=1e-4)
+
+    # 2. Grosses Fenster: Punkt-Deckel 2400 (hier 10 s Span -> 5 ms greift
+    #    zuerst; Deckel pruefen ueber kuenstlich lange Zyklen nicht noetig,
+    #    aber die Punktzahl bleibt unter dem Deckel).
+    out2 = power_cycles.render_session_average(
+        analysis, samples, window_start_s=0.0, window_end_s=10.0)
+    s2 = out2["avg"][0]
+    assert len(s2["t_s"]) <= power_cycles.MAX_AVG_POINTS_ZOOM + 1
+
+    # 3. Ohne Fenster: alter 20-ms-Deckel-Pfad unveraendert.
+    out3 = power_cycles.render_session_average(analysis, samples)
+    s3 = out3["avg"][0]
+    assert len(s3["t_s"]) <= power_cycles.MAX_AVG_POINTS + 1
 
 
 def test_render_session_average_unit_empty(client):
