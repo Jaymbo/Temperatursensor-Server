@@ -238,6 +238,65 @@ class TestOverlay:
         assert len(overlay["cycles"]) == 3
 
 
+class TestOverlayDownsampling:
+    """LTTB-Downsampling + Zoom-Fenster im Overlay (Performance-Fix)."""
+
+    def test_lttb_keeps_first_last_and_reduces(self):
+        # 1000 Punkte -> 100 ausgewaehlt; erster/letzter bleiben immer.
+        t = [i * 0.01 for i in range(1000)]
+        ma = [100.0 + (50.0 if i % 7 == 0 else 0.0) for i in range(1000)]
+        keep, n = power_cycles._lttb_select(t, ma, 100)
+        assert n == 100
+        assert keep[0] == 0 and keep[-1] == 999
+        assert len(set(keep)) == 100  # monoton & eindeutig
+
+    def test_lttb_no_downsampling_if_below_target(self):
+        t = [0.0, 1.0, 2.0]
+        keep, n = power_cycles._lttb_select(t, [1, 2, 3], 100)
+        assert keep == [0, 1, 2] and n == 3
+
+    def test_overlay_default_downsamples(self):
+        # Synthetischer Zyklus mit vielen Samples (> 500) -> Overlay klein.
+        pts = _synthetic_profile(0.8)
+        pts = [(t, ma) for t, ma in pts] + [
+            (pts[-1][0] + (i + 1) * 0.005, 74.5) for i in range(2000)]
+        overlay = power_cycles.build_overlay(_measurements(pts))
+        c = overlay["cycles"][0]
+        assert len(c["t_s"]) <= power_cycles.DEFAULT_MAX_POINTS_PER_CYCLE
+        # Peaks im Downsample nicht weggebuegelt (LTTB bewahrt Extrema besser).
+        assert max(c["ma"]) >= 130.0
+
+    def test_overlay_window_zooms_into_detail(self):
+        pts = _synthetic_profile(0.8)
+        pts += [(pts[-1][0] + (i + 1) * 0.005, 74.5) for i in range(2000)]
+        m = _measurements(pts)
+        full = power_cycles.build_overlay(m)
+        # Fenster um den Trigger (t=5 s): 4.0 .. 6.5 s
+        win = power_cycles.build_overlay(m, window_start_s=4.0, window_end_s=6.0)
+        fc, wc = full["cycles"][0], win["cycles"][0]
+        # Fenster (4..6 s = 400 Punkte < Ziel-500) behaelt die VOLLE
+        # Aufloesung (gleichmaessiges 5-ms-Raster), waehrend die Gesamtansicht
+        # per LTTB ungleichmaessig verdichtet ist.
+        assert len(wc["t_s"]) <= 500
+        gaps = [b - a for a, b in zip(wc["t_s"], wc["t_s"][1:])]
+        assert max(gaps) == pytest.approx(0.005, abs=1e-6)  # 200 Hz erhalten
+        full_gaps = [b - a for a, b in zip(fc["t_s"], fc["t_s"][1:])]
+        assert max(full_gaps) > 0.01  # verdichtet
+        # Fenster relativ zum Fensteranfang (4.0 s): erste Koordinate ~0.
+        assert wc["t_s"][0] == pytest.approx(0.0, abs=0.01)
+        # Trigger liegt jetzt bei 5.0 - 4.0 = 1.0 s
+        assert wc["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.01)
+
+    def test_overlay_window_without_downsampling(self):
+        pts = _synthetic_profile(0.8)
+        pts += [(pts[-1][0] + (i + 1) * 0.005, 74.5) for i in range(2000)]
+        m = _measurements(pts)
+        win = power_cycles.build_overlay(m, window_start_s=4.0, window_end_s=6.5,
+                                         max_points_per_cycle=0)
+        # 0 = kein Downsampling; Fenster 2.5 s @ 200 Hz = ~500 Punkte
+        assert len(win["cycles"][0]["t_s"]) > 100
+
+
 class TestEdgeCases:
     """Randfaelle fuer 100% Coverage der Analyse-Logik."""
 

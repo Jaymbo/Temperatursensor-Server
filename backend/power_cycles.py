@@ -40,6 +40,11 @@ DEFAULT_SPIKE_END_MA = 85.0      # darunter: TX-Burst vorbei (zwischen
 DEFAULT_MAX_CYCLE_S = 120.0      # Deckel fuer den UNTERBROCHENEN letzten Zyklus
 DEFAULT_GAP_S = 5.0              # Datenloch im Zyklusfenster -> gap-Markierung
 
+# Overlay-Rendering: max. Punkte je Zyklus nach LTTB-Downsampling. 500 Punkte
+# rendern zuegig; die volle Aufloesung liefert der Endpoint beim Reinzoomen
+# (window_start_s/window_end_s) nach.
+DEFAULT_MAX_POINTS_PER_CYCLE = 500
+
 
 def _parse_iso(value):
     try:
@@ -398,14 +403,65 @@ def analyze_cycles_by_session(
     return {**analysis, "cycles": cycles, "sessions": summarize_by_session(cycles)}
 
 
+def _lttb_select(t_s: list[float], ma: list[float], target_n: int) -> tuple[list[int], int]:
+    """
+    LTTB (Largest-Triangle-Three-Buckets) Auswahl von `target_n` Indizes aus
+    einer Reihe (t_s, ma) - bewahrt Peaks und Form besser als gleichmaessiges
+    Abtasten. Erster und letzter Punkt werden immer behalten.
+
+    @return (ausgewaehlte Indizes, effektive Punktzahl)
+    """
+    n = len(t_s)
+    if n <= target_n:
+        return list(range(n)), n
+
+    # Buckets ueber den Indexbereich; jeder Bucket liefert einen Punkt.
+    bucket_size = (n - 2) / (target_n - 2)
+    selected: list[int] = [0]
+    prev_idx = 0
+    for b in range(target_n - 2):
+        # Bucket-Grenzen (Indizes in die Ausgangsreihe)
+        a = int(1 + b * bucket_size)
+        z = min(n - 1, int(1 + (b + 1) * bucket_size))
+        z = max(z, a + 1)
+        # Mittelungspunkt des NAECHSTEN Buckets (LTTB-Definition)
+        na = int(1 + (b + 1) * bucket_size)
+        nz = min(n - 1, int(1 + (b + 2) * bucket_size))
+        nz = max(nz, na + 1)
+        avg_t = sum(t_s[na:nz]) / (nz - na)
+        avg_ma = sum(ma[na:nz]) / (nz - na)
+        best_i, best_area = a, -1.0
+        for i in range(a, z):
+            ax, ay = t_s[prev_idx], ma[prev_idx]
+            bx, by = t_s[i], ma[i]
+            cx, cy = avg_t, avg_ma
+            area = abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
+            if area > best_area:
+                best_area, best_i = area, i
+        selected.append(best_i)
+        prev_idx = best_i
+    selected.append(n - 1)
+    return selected, len(selected)
+
+
 def build_overlay(
     measurements: list[dict],
     limit: int = 20,
+    window_start_s: float | None = None,
+    window_end_s: float | None = None,
+    max_points_per_cycle: int = DEFAULT_MAX_POINTS_PER_CYCLE,
     **kwargs,
 ) -> dict:
     """
     Oszilloskop-Overlay: die letzten `limit` Zyklen, alle auf t=0
     (Zyklusanfang = Trigger - pre_peak_s) synchronisiert.
+
+    Optionaler Ausschnitt: window_start_s/window_end_s (relativ zum
+    Zyklusanfang) beschneiden jeden Zyklus auf dieses Fenster - Grundlage
+    fuer das Zoom-Nachladen im Frontend.
+
+    Downsampling: pro Zyklus auf max_points_per_cycle Punkte per LTTB
+    (siehe _lttb_select); Landmark-/Phasengrenzen bleiben immer erhalten.
 
     @return {"cycles": [{start, duration_s, landmarks, t_s: [...], ma: [...]}]}
     """
@@ -416,15 +472,30 @@ def build_overlay(
         # Zugehoerige Rohproben: ueber t0_s und Dauer aus dem Stream schneiden.
         t0 = c["t0_s"]
         t1 = t0 + c["duration_s"]
-        t_s = []
-        ma = []
+        # Zoom-Fenster anwenden (Achse: Sekunden seit Zyklusanfang).
+        # Epsilon 1e-6: Rand-Samples trotz Fließkomma-Drift aus ISO->s
+        # (datetime.total_seconds) nicht versehentlich verwerfen.
+        w0 = t0 + (window_start_s if window_start_s is not None else 0.0)
+        w1 = t1 + 1e-9 if window_end_s is None else t0 + max(window_end_s, 0.0) + 1e-9
+        t_s: list[float] = []
+        ma: list[float] = []
         for t, cur in samples:
-            if t < t0 - 1e-9:
+            if t < w0 - 1e-6:
                 continue
-            if t > t1 + 1e-9:
+            if t > w1:
                 break
             t_s.append(round(t - t0, 4))
             ma.append(round(cur, 4))
+        # Downsampling (Punkte fuer die Darstellung reduzieren, Form/Peaks
+        # bleiben per LTTB erhalten). Bei Zoom-Fenster: absolute t in das
+        # Fenster-relative Koordinatensystem verschieben.
+        if window_start_s is not None:
+            rel = float(window_start_s)
+            t_s = [round(t - rel, 4) for t in t_s]
+        if max_points_per_cycle and len(t_s) > max_points_per_cycle:
+            keep, _ = _lttb_select(t_s, ma, max_points_per_cycle)
+            t_s = [t_s[i] for i in keep]
+            ma = [ma[i] for i in keep]
         out.append({
             "start": c["start"],
             "duration_s": c["duration_s"],

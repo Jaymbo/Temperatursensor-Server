@@ -1204,6 +1204,9 @@ def power_cycles_overlay_endpoint(
     since: str | None = None,
     limit: int | None = None,
     overlay_limit: int = 20,
+    window_start_s: float | None = None,
+    window_end_s: float | None = None,
+    max_points_per_cycle: int = 500,
     peak_trigger_ma: float | None = None,
     pre_peak_s: float | None = None,
     refractory_s: float | None = None,
@@ -1214,6 +1217,11 @@ def power_cycles_overlay_endpoint(
     """
     Oszilloskop-Overlay: die letzten `overlay_limit` Zyklen, alle auf t=0
     (Zyklusanfang) synchronisiert, inkl. Landmarks und Phasen.
+
+    Performance: Rohproben werden per LTTB auf `max_points_per_cycle` Punkte
+    pro Zyklus reduziert (Default 500 statt ~10.000). Beim Reinzoomen ruft
+    das Frontend `window_start_s`/`window_end_s` (Sekunden seit Zyklusanfang)
+    auf, um das Zeitfenster in voller Aufloesung nachzuladen.
     """
     # Wichtig: fuer die Overlay-Ansicht die VOLLSTAENDIGEN Rohdaten nehmen,
     # damit die letzten Zyklen nicht durch ein kleines Daten-Limit beschnitten
@@ -1221,4 +1229,8 @@ def power_cycles_overlay_endpoint(
     measurements = get_power_measurements(logger_id, since=since, limit=limit)
     kwargs = _power_cycle_kwargs(peak_trigger_ma, pre_peak_s, refractory_s,
                                  spike_end_ma, max_cycle_s, gap_s)
-    return power_cycles.build_overlay(measurements, limit=overlay_limit, **kwargs)
+    return power_cycles.build_overlay(
+        measurements, limit=overlay_limit,
+        window_start_s=window_start_s, window_end_s=window_end_s,
+        max_points_per_cycle=max_points_per_cycle, **kwargs,
+    )

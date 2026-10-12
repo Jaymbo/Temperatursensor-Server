@@ -78,15 +78,23 @@ export const usePowerData = () => {
     }
   }, []);
 
-  const loadCycles = useCallback(async (loggerId: string, overlayLimit = 20) => {
+  const loadCycles = useCallback(async (loggerId: string, overlayLimit = 20,
+                                        window?: { startS: number; endS: number },
+                                        maxPointsPerCycle = 500) => {
     setIsLoading(true);
     setError(null);
     try {
       // Overlay (Rohkurven je Zyklus) und Statistik (Phasen-Dauern + Sessions)
       // parallel. Die Session-Zusammenfassung kommt aus /power/sessions
       // (Firmware-Versionsvergleich: Verbrauch pro Zyklus je Session).
+      // Beim Reinzoomen liefert `window` den Ausschnitt (Sekunden seit
+      // Zyklusanfang) - der Server antwortet dann mit voller Aufloesung.
+      const winParams = window
+        ? `&window_start_s=${window.startS}&window_end_s=${window.endS}`
+        : "";
       const [overlayRes, cyclesRes, sessionsRes] = await Promise.all([
-        fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}`)),
+        fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}` +
+          `&max_points_per_cycle=${maxPointsPerCycle}${winParams}`)),
         fetch(buildApiUrl(`/power/cycles/${loggerId}`)),
         fetch(buildApiUrl(`/power/sessions/${loggerId}`)),
       ]);

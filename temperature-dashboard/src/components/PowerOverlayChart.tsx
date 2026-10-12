@@ -50,19 +50,34 @@ const LANDMARK_LABEL: Record<string, string> = {
 interface Props {
   cycles: PowerCycle[];
   height?: string;
+  /**
+   * Wird nach einem Zoom/Pan mit dem sichtbaren Fenster (Sekunden seit
+   * Zyklusanfang) aufgerufen - das Frontend laedt diesen Ausschnitt dann
+   * in voller Aufloesung nach (serverseitiges LTTB-Downsampling).
+   * `null` = Zoom zurueckgesetzt -> wieder die uebersichtliche Ansicht.
+   */
+  onZoomWindow?: (win: { startS: number; endS: number } | null) => void;
 }
 
-export const PowerOverlayChart = ({ cycles, height = "45vh" }: Props) => {
+export const PowerOverlayChart = ({ cycles, height = "45vh", onZoomWindow }: Props) => {
   const chartRef = useRef<any>(null);
+  const zoomDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Esc = Zoom zuruecksetzen (wie im Haupt-Chart).
+  // Esc = Zoom zuruecksetzen (wie im Haupt-Chart) -> uebersichtliche Ansicht.
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") chartRef.current?.resetZoom?.();
+      if (e.key === "Escape") {
+        chartRef.current?.resetZoom?.();
+        if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
+        onZoomWindow?.(null);
+      }
     };
     window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, []);
+    return () => {
+      window.removeEventListener("keydown", handleKey);
+      if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
+    };
+  }, [onZoomWindow]);
   const chartData = useMemo<ChartData<"line">>(() => {
     const datasets: ChartData<"line">["datasets"] = [];
 
@@ -132,10 +147,26 @@ export const PowerOverlayChart = ({ cycles, height = "45vh" }: Props) => {
           wheel: { enabled: true },
           pinch: { enabled: true },
           mode: "x" as const,
+          // Nach dem Zoom das Fenster melden (debounced, damit schnelles
+          // Mausraden nicht jede Stufe nachlaedt).
+          onZoomComplete: ({ chart }: any) => {
+            if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
+            const x = chart.scales.x;
+            zoomDebounceRef.current = setTimeout(() => {
+              onZoomWindow?.({ startS: x.min, endS: x.max });
+            }, 400);
+          },
         },
         pan: {
           enabled: true,
           mode: "x" as const,
+          onPanComplete: ({ chart }: any) => {
+            if (zoomDebounceRef.current) clearTimeout(zoomDebounceRef.current);
+            const x = chart.scales.x;
+            zoomDebounceRef.current = setTimeout(() => {
+              onZoomWindow?.({ startS: x.min, endS: x.max });
+            }, 400);
+          },
         },
       },
     },

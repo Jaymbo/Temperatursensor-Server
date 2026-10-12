@@ -55,6 +55,9 @@ function App() {
   const [batteryHistory, setBatteryHistory] = useState<BatteryHistory | null>(null);
   const [showPower, setShowPower] = useState<boolean>(false);
   const [powerLogger, setPowerLogger] = useState<string | null>(null);
+  // Gezoomtes Overlay-Fenster (Sekunden seit Zyklusanfang) -> Nachladen in
+  // voller Aufloesung; null = Gesamtansicht (downgesampelt).
+  const [powerZoomWindow, setPowerZoomWindow] = useState<{ startS: number; endS: number } | null>(null);
   const power = usePowerData();
   const {
     summary: batterySummary,
@@ -84,9 +87,18 @@ function App() {
   // Logger-Auswahl -> Zyklen + Statistik laden.
   useEffect(() => {
     if (!powerLogger) return;
+    setPowerZoomWindow(null); // Logger-Wechsel: Zoom zuruecksetzen
     power.loadCycles(powerLogger);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [powerLogger]);
+
+  // Zoom-Fenster geaendert -> Overlay-Ausschnitt in voller Aufloesung nachladen.
+  useEffect(() => {
+    if (!powerLogger) return;
+    power.loadCycles(powerLogger, 20, powerZoomWindow ?? undefined,
+      powerZoomWindow ? 5000 : 500);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [powerZoomWindow]);
 
   // Verlauf des ausgewaehlten Sensors laden (fuer den Akku-Chart).
   useEffect(() => {
@@ -1021,7 +1033,7 @@ function App() {
                   <h4 style={{ margin: '0 0 8px' }}>
                     Zyklus-Overlay · Logger #{powerLogger}
                   </h4>
-                  <PowerOverlayChart cycles={power.cycles} />
+                  <PowerOverlayChart cycles={power.cycles} onZoomWindow={setPowerZoomWindow} />
                   <h4 style={{ margin: '16px 0 8px' }}>Phasen-Dauern (min / Median / max)</h4>
                   <PowerPhaseTable stats={power.stats} />
                   <h4 style={{ margin: '16px 0 8px' }}>Verbrauch pro Session (Firmware-Versionsvergleich)</h4>
