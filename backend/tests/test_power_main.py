@@ -2,20 +2,22 @@
 
 import datetime
 
-import db as dbmod
+import pytest
+
+import power_cycles
 
 
 BASE = datetime.datetime(2026, 10, 12, 12, 0, 0)
 
-# Gesamtdauer eines synthetischen Profils (Schlaf+Wake+Mess+WLAN+Send+Schlaf)
-PROFILE_DURATION_S = 2.0 + 0.1 + 1.0 + 0.8 + 0.5 + 3.0
+# Gesamtdauer eines synthetischen Profils (5 s Grundlast + Burst + Rest)
+PROFILE_DURATION_S = 10.0
 
 
 def _synthetic_profile(wlan_duration_s: float = 0.8, offset_s: float = 0.0) -> list[tuple[float, float]]:
     """
-    Ein Zyklus: 2 s Ruhe (0.1 mA), Wake-Spike (150 mA, 0.1 s), Messphase
-    (10 mA, 1 s), WLAN (60 mA, wlan_duration_s), Send (120 mA, 0.5 s),
-    Ruhe (3 s). Sample-Raster 5 ms (wie Firmware).
+    Ein Zyklus (echtes Profil nachgebaut): 5 s Grundlast (~74 mA), TX-Burst
+    (~135 mA, 0.2 + wlan_duration_s), Grundlast bis Zyklusende = 10 s.
+    Sample-Raster 5 ms (wie Firmware).
     """
     pts = []
     t = 0.0
@@ -27,12 +29,9 @@ def _synthetic_profile(wlan_duration_s: float = 0.8, offset_s: float = 0.0) -> l
             pts.append((round(t + offset_s, 3), ma))
             t += dt
 
-    phase(2.0, 0.1)                       # Schlaf
-    phase(0.1, 150.0)                     # Wake-Spike
-    phase(1.0, 10.0)                      # Messphase
-    phase(wlan_duration_s, 60.0)          # WLAN-Connect
-    phase(0.5, 120.0)                     # HTTP-Send
-    phase(3.0, 0.1)                       # Schlaf danach
+    phase(5.0, 74.5)                       # Grundlast-Vorlauf
+    phase(0.2 + wlan_duration_s, 135.0)    # TX-Burst (Trigger + Rest)
+    phase(10.0 - 5.0 - 0.2 - wlan_duration_s, 74.5)  # Grundlast nach Burst
     return pts
 
 
@@ -69,25 +68,24 @@ def test_power_cycles_detects_phases(client):
     assert len(data["cycles"]) == 1
 
     cycle = data["cycles"][0]
-    assert cycle["peak_ma"] == 150.0
+    assert cycle["peak_ma"] == 135.0
     assert cycle["truncated"] is False
 
-    # Landmarks sind relativ zum Zyklusstart (wake = Trigger = 0.0)
+    # Landmarks sind relativ zum Zyklusanfang (Trigger bei pre_peak_s = 5.0)
     lm = cycle["landmarks"]
-    assert lm["wake"]["start_s"] == 0.0
-    assert 0.05 <= lm["spike_end"]["start_s"] <= 0.15
-    assert lm["wlan"]["start_s"] == 1.1
-    assert lm["send"]["start_s"] == 1.9
+    assert lm["trigger"]["start_s"] == 5.0
+    # spike_end = Burst-Ende (Trigger + 1.0 s Burst) = 6.0 s nach Zyklusanfang
+    assert 5.9 <= lm["spike_end"]["start_s"] <= 6.1
 
-    # stats: Median der WLAN-Phase ~ 0.8 s (nur ein Zyklus)
-    assert data["stats"]["wlan"]["median_s"] == 0.8
+    # stats: Median der Spike-Phase ~ 1.0 s (nur ein Zyklus)
+    assert data["stats"]["spike"]["median_s"] == pytest.approx(1.0, abs=0.05)
 
 
 def test_power_cycles_threshold_override(client):
-    """trigger_ma sehr hoch -> Zyklus wird nicht mehr erkannt."""
+    """peak_trigger_ma ueber Peak -> Zyklus wird nicht mehr erkannt."""
     _post_samples(client, "2", _synthetic_profile())
     data = client.get(
-        "/power/cycles/2", params={"trigger_ma": 1000.0}
+        "/power/cycles/2", params={"peak_trigger_ma": 1000.0}
     ).json()
     assert data["cycles"] == []
 
@@ -100,16 +98,16 @@ def test_power_cycles_overlay(client):
     )
     _post_samples(client, "3", pts)
     data = client.get("/power/cycles/3/overlay").json()
-    # Beide Zyklen synchronisiert auf t=0 (Trigger)
+    # Beide Zyklen synchronisiert auf t=0 (Zyklusanfang)
     assert len(data["cycles"]) == 2
     first = data["cycles"][0]
     assert first["t_s"][0] == 0.0
-    assert first["ma"][0] == 150.0
-    assert first["landmarks"]["wake"]["start_s"] == 0.0
+    assert first["ma"][0] == 74.5
+    assert first["landmarks"]["trigger"]["start_s"] == 5.0
     # Start-Timestamps unterscheiden sich (zweiter Zyklus spaeter)
     assert data["cycles"][1]["start"] != first["start"]
-    # Laengere WLAN-Phase im zweiten Zyklus sichtbar
-    assert data["cycles"][1]["phases"]["wlan"]["duration_s"] == 2.5
+    # Laengere Burst-Phase im zweiten Zyklus sichtbar
+    assert data["cycles"][1]["phases"]["spike"]["duration_s"] == pytest.approx(2.7, abs=0.05)
 
 
 def test_power_cycles_overlay_limit(client):
@@ -150,7 +148,6 @@ def _create_sessions(client, specs: list[tuple[str, str | None]]):
 
     specs: [(sensor_id, custom_text-oder-None), ...] in Reihenfolge.
     """
-    import db as dbmod
     out = []
     for sensor_id, custom_text in specs:
         if custom_text is not None:
@@ -189,7 +186,6 @@ def test_power_sessions_assignment_and_summary(client):
 
 def test_power_sessions_unit_assignment(client):
     """Unit: Zuordnungsregel 'spaeteste start_time <= Zyklusstart'."""
-    import power_cycles
     sessions = [
         {"id": 10, "start_time": "2026-10-12T12:00:00"},
         {"id": 11, "start_time": "2026-10-12T13:00:00"},
@@ -214,10 +210,10 @@ def test_power_sessions_empty(client):
 def test_power_sessions_threshold_override(client):
     """Alle Schwellwert-Parameter werden an die Analyse durchgereicht."""
     _post_samples(client, "8", _profile_chain(1))
-    # trigger_ma ueber Peak -> kein Zyklus mehr erkannt
+    # peak_trigger_ma ueber Peak -> kein Zyklus mehr erkannt
     data = client.get("/power/sessions/8", params={
-        "trigger_ma": 1000.0, "quiet_ma": 1.0, "min_quiet_s": 0.5,
-        "max_cycle_s": 30.0, "gap_s": 2.0,
+        "peak_trigger_ma": 1000.0, "pre_peak_s": 1.0, "refractory_s": 0.5,
+        "spike_end_ma": 85.0, "max_cycle_s": 30.0, "gap_s": 2.0,
     }).json()
     assert data["cycles"] == []
     assert data["sessions"] == []

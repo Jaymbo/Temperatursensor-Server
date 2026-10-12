@@ -1,8 +1,12 @@
 """Tests fuer die Zyklus-Erkennung / das Oszilloskop-Overlay (power_cycles).
 
-Synthetische Stromprofile: Ruhe (schlafender Logger) -> Wake-Spike -> Messphase ->
-WLAN-Connect -> HTTP-Transmit -> Ruhe. Ein Profil-Variant prueft den Fall
-"Server erst spaeter erreicht" (laengere WLAN-Phase).
+Peak-basierte Zyklus-Definition (siehe power_cycles-Moduldoc): Trigger =
+erstes Sample ueber peak_trigger_ma (Default 100 mA), Zyklus = Trigger - 5 s
+bis naechster Trigger - 5 s, Refraktaerzeit 10 s nach dem Trigger.
+
+Synthetische Profile: Der echte Logger zieht DAUERHAFT ~74 mA Grundlast
+(keine Ruhe < 2 mA!), nutzbare Energie steckt im TX-Burst (Peak ~135 mA,
+~1,6 s). Die Profile ahmen das nach.
 """
 
 import importlib.util
@@ -35,11 +39,12 @@ def _measurements(points: list[tuple[float, float]]) -> list[dict]:
     ]
 
 
-def _synthetic_profile(wlan_duration_s: float = 0.8) -> list[tuple[float, float]]:
+def _synthetic_profile(wlan_duration_s: float = 0.8, base_ma: float = 74.5,
+                       peak_ma: float = 135.0) -> list[tuple[float, float]]:
     """
-    Ein Zyklus: 2 s Ruhe (0.1 mA), Wake-Spike (150 mA, 0.1 s), Messphase
-    (10 mA, 1 s), WLAN (60 mA, wlan_duration_s), Send (120 mA, 0.5 s),
-    Ruhe (3 s). Sample-Raster 5 ms (wie Firmware).
+    Ein Zyklus (echtes Profil nachgebaut): 5 s Grundlast (~74 mA), dann
+    TX-Burst (~135 mA, 0.2 + wlan_duration_s), dann Grundlast bis
+    Zyklusende = 10 s. Sample-Raster 5 ms (wie Firmware).
     """
     pts = []
     t = 0.0
@@ -51,95 +56,160 @@ def _synthetic_profile(wlan_duration_s: float = 0.8) -> list[tuple[float, float]
             pts.append((round(t, 3), ma))
             t += dt
 
-    phase(2.0, 0.1)                       # Schlaf
-    phase(0.1, 150.0)                     # Wake-Spike
-    phase(1.0, 10.0)                      # Messphase
-    phase(wlan_duration_s, 60.0)          # WLAN-Connect
-    phase(0.5, 120.0)                     # HTTP-Send
-    phase(3.0, 0.1)                       # Schlaf danach
+    phase(5.0, base_ma)                  # Grundlast-Vorlauf
+    phase(0.2 + wlan_duration_s, peak_ma)  # TX-Burst (Trigger + Rest)
+    phase(10.0 - 5.0 - 0.2 - wlan_duration_s, base_ma)  # Grundlast nach Burst
     return pts
 
 
+def _profile_chain(count: int, wlan_duration_s: float = 0.8) -> list[tuple[float, float]]:
+    """`count` Zyklen hintereinander, ohne ueberlappende Zeitstempel."""
+    pts = []
+    offset = 0.0
+    for _ in range(count):
+        pts += [(t + offset, ma) for t, ma in _synthetic_profile(wlan_duration_s)]
+        offset += 10.0
+    return pts
+
+
+class TestTriggerDetection:
+    def test_trigger_is_first_sample_above_threshold(self):
+        samples = power_cycles._prepare_samples(
+            _measurements(_synthetic_profile()))
+        triggers = power_cycles._find_trigger_indices(samples, 100.0, 10.0)
+        assert len(triggers) == 1
+        # Trigger = erstes Sample des TX-Bursts (Grundlast endet bei t=5.0).
+        assert samples[triggers[0]][0] == pytest.approx(5.0, abs=0.01)
+
+    def test_refractory_debounces_long_burst(self):
+        # Burst von 2 s (400 Samples ueber der Schwelle) -> nur EIN Trigger.
+        dt = 0.005
+        pts = [((i * dt), 80.0) for i in range(int(5.0 / dt))]
+        pts += [((5.0 + i * dt), 150.0) for i in range(int(2.0 / dt))]
+        samples = power_cycles._prepare_samples(_measurements(pts))
+        triggers = power_cycles._find_trigger_indices(samples, 100.0, 10.0)
+        assert len(triggers) == 1
+        assert samples[triggers[0]][0] == pytest.approx(5.0, abs=0.01)
+
+    def test_refractory_ends_then_new_trigger(self):
+        # Zwei Buerste im Abstand 12 s (Refraktaer 10 s) -> zwei Trigger.
+        pts = []
+        for start in (0.0, 12.0):
+            pts += [((start + i * 0.005), 150.0) for i in range(40)]
+        samples = power_cycles._prepare_samples(_measurements(pts))
+        triggers = power_cycles._find_trigger_indices(samples, 100.0, 10.0)
+        assert len(triggers) == 2
+
+    def test_short_burst_below_trigger_no_cycle(self):
+        # Nur Grundlast -> kein Trigger.
+        pts = [((i * 0.005), 74.5) for i in range(int(20.0 / 0.005))]
+        samples = power_cycles._prepare_samples(_measurements(pts))
+        assert power_cycles._find_trigger_indices(samples, 100.0, 10.0) == []
+
+
 class TestSegmentation:
-    def test_single_cycle_detected(self):
+    def test_single_cycle_with_pre_window(self):
         samples = power_cycles._prepare_samples(_measurements(_synthetic_profile()))
         cycles = power_cycles.segment_cycles(samples)
         assert len(cycles) == 1
         seg = cycles[0]
         assert not seg["truncated"]
         assert not seg["gap"]
-        # Zyklus startet beim Wake-Spike (t=2.0 s) und endet vor dem Schlaf.
-        assert samples[seg["start_idx"]][0] == pytest.approx(2.0, abs=0.01)
-        end_t = samples[seg["end_idx"]][0]
-        assert 3.5 <= end_t <= 5.0          # Send endet ~3.6 s, Schlaf danach
+        # Zyklus = Trigger (5.0) - 5 s Vorlauf bis Streamende (Grundlast bis 10).
+        assert samples[seg["start_idx"]][0] == pytest.approx(0.0, abs=0.01)
+        assert samples[seg["end_idx"]][0] == pytest.approx(10.0, abs=0.01)
+        assert samples[seg["trigger_idx"]][0] == pytest.approx(5.0, abs=0.01)
 
-    def test_two_cycles_with_gap_between(self):
-        pts = _synthetic_profile() + _synthetic_profile(wlan_duration_s=1.5)
-        # Zweiten Zyklus zeitversetzt einfuegen (nach 8 s Ruhe).
-        offset = pts[-1][0] + 2.0
-        pts = [(t, ma) for t, ma in pts] + [(t + offset, ma) for t, ma in pts]
-        samples = power_cycles._prepare_samples(_measurements(pts))
+    def test_two_cycles_sliced_before_next_trigger(self):
+        samples = power_cycles._prepare_samples(_measurements(_profile_chain(2)))
         cycles = power_cycles.segment_cycles(samples)
         assert len(cycles) == 2
-        assert not cycles[0]["truncated"]
-        assert not cycles[1]["truncated"]
+        for seg in cycles:
+            assert not seg["truncated"]
+            assert not seg["gap"]
+        # Erster Zyklus endet 5 s vor dem zweiten Trigger (t=15) -> t=10.0.
+        assert samples[cycles[0]["end_idx"]][0] == pytest.approx(10.0, abs=0.01)
+        assert samples[cycles[1]["start_idx"]][0] == pytest.approx(10.0, abs=0.01)
+        assert samples[cycles[1]["trigger_idx"]][0] == pytest.approx(15.0, abs=0.01)
 
-    def test_data_gap_ends_cycle(self):
-        # Loch MITTEN im Zyklus (6 s, z. B. Sende-Pause des Mess-ESP, die in die
-        # WLAN-Phase faellt) beendet den Zyklus -> Luecke wird markiert.
+    def test_data_gap_marked_within_cycle(self):
+        # Loch MITTEN im Zyklus (6 s) -> gap-Markierung (der Zyklus selbst
+        # bleibt im neuen Modell bestehen).
         pts = []
         for t, ma in _synthetic_profile():
-            if t < 3.2:                     # bis Anfang WLAN-Phase
+            if t < 6.0:
                 pts.append((t, ma))
-            elif t >= 3.2:                  # Rest 6 s versetzt ANHANGEN
+            else:
                 pts.append((t + 6.0, ma))
         samples = power_cycles._prepare_samples(_measurements(pts))
         cycles = power_cycles.segment_cycles(samples)
+        assert len(cycles) == 1
         assert cycles[0]["gap"]
 
+    def test_last_cycle_truncated_at_max_cycle_s(self):
+        # Dauer-Peak > max_cycle_s mit langer Refraktaerzeit -> EIN Zyklus,
+        # der am Deckel abgeschnitten wird.
+        pts = [((i * 0.005), 150.0) for i in range(int(300 / 0.005))]
+        samples = power_cycles._prepare_samples(_measurements(pts))
+        cycles = power_cycles.segment_cycles(samples, max_cycle_s=120.0,
+                                             refractory_s=400.0)
+        assert len(cycles) == 1
+        assert cycles[0]["truncated"]
+        assert samples[cycles[0]["end_idx"]][0] == pytest.approx(120.005, abs=0.01)
 
-class TestLandmarks:
-    def test_phases_of_short_connect(self):
+    def test_continuous_peak_yields_cycle_per_refractory_period(self):
+        # Dauer-Peak mit Default-Refraktaerzeit: alle refractory_s ein Trigger,
+        # jeder Zyklus ~10 s lang, keiner truncated.
+        pts = [((i * 0.005), 150.0) for i in range(int(300 / 0.005))]
+        samples = power_cycles._prepare_samples(_measurements(pts))
+        cycles = power_cycles.segment_cycles(samples)
+        assert len(cycles) == 30
+        assert all(not c["truncated"] for c in cycles)
+        assert samples[cycles[1]["trigger_idx"]][0] == pytest.approx(10.0, abs=0.01)
+
+
+class TestLandmarksAndPhases:
+    def test_phases_of_standard_profile(self):
         analysis = power_cycles.analyze_cycles(_measurements(_synthetic_profile(0.8)))
         assert len(analysis["cycles"]) == 1
         c = analysis["cycles"][0]
-        assert c["phases"]["wake"]["duration_s"] == pytest.approx(0.1, abs=0.05)
-        # WLAN-Phase ~0.8 s (60 mA >= 40 mA), dann Send (120 mA).
-        assert c["phases"]["wlan"]["duration_s"] == pytest.approx(0.8, abs=0.1)
-        assert c["phases"]["send_tail"]["duration_s"] >= 0.3
+        assert c["peak_ma"] == pytest.approx(135.0, abs=0.1)
+        # Phasen: pre_peak = Vorlauf (5 s), spike = Burst (1.0 s), tail = Rest.
+        assert c["phases"]["pre_peak"]["duration_s"] == pytest.approx(5.0, abs=0.05)
+        assert c["phases"]["spike"]["duration_s"] == pytest.approx(1.0, abs=0.1)
+        assert c["phases"]["tail"]["duration_s"] == pytest.approx(4.0, abs=0.1)
+        assert c["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.01)
+        # spike_end = erster Fall unter 85 mA nach dem Trigger.
+        assert c["landmarks"]["spike_end"]["start_s"] == pytest.approx(6.0, abs=0.1)
 
-    def test_longer_connect_visible_in_duration(self):
+    def test_longer_burst_visible_in_duration(self):
         short = power_cycles.analyze_cycles(_measurements(_synthetic_profile(0.8)))
         long_ = power_cycles.analyze_cycles(_measurements(_synthetic_profile(2.5)))
-        d_short = short["cycles"][0]["phases"]["wlan"]["duration_s"]
-        d_long = long_["cycles"][0]["phases"]["wlan"]["duration_s"]
-        # "Manchmal braucht der Teil so lange, manchmal aber auch laenger."
+        d_short = short["cycles"][0]["phases"]["spike"]["duration_s"]
+        d_long = long_["cycles"][0]["phases"]["spike"]["duration_s"]
         assert d_long > d_short + 1.0
 
     def test_stats_median_and_spread(self):
         pts = []
         for wlan_s in (0.8, 0.8, 2.5):
             p = _synthetic_profile(wlan_s)
-            offset = (pts[-1][0] + 2.0) if pts else 0.0
+            offset = (pts[-1][0] + 5.0) if pts else 0.0
             pts += [(t + offset, ma) for t, ma in p]
         analysis = power_cycles.analyze_cycles(_measurements(pts))
-        stats = analysis["stats"]["wlan"]
+        stats = analysis["stats"]["spike"]
         assert stats["n"] == 3
-        assert stats["median_s"] == pytest.approx(0.8, abs=0.1)
+        assert stats["median_s"] == pytest.approx(1.0, abs=0.1)
         assert stats["max_s"] > stats["median_s"] + 1.0
 
-    def test_missing_landmark_falls_back(self):
-        # Zyklus OHNE TX-Burst ueber 80 mA (Server nie erreicht) -> send-Landmark
-        # fehlt. Semantik: Die WLAN-Phase laeuft dann bis zum ZYKLENDE (der ESP
-        # wiederholt Connect/Send), statt sie sofort zu beenden.
-        pts = [p for p in _synthetic_profile(0.8) if p[1] < 80.0]
+    def test_missing_spike_end_falls_back(self):
+        # Strom bleibt die ganze Zeit ueber spike_end_ma -> kein spike_end-
+        # Landmark; die spike-Phase laeuft bis zum Zyklusende.
+        pts = [((i * 0.005), 150.0) for i in range(int(2.0 / 0.005))]
         analysis = power_cycles.analyze_cycles(_measurements(pts))
         c = analysis["cycles"][0]
-        assert c["landmarks"]["send"] is None
-        assert c["phases"]["wlan"]["end_s"] == pytest.approx(
-            c["duration_s"], abs=0.01
-        )
-        assert c["phases"]["send_tail"]["duration_s"] == pytest.approx(0.0, abs=0.01)
+        assert c["landmarks"]["spike_end"] is None
+        assert c["phases"]["spike"]["end_s"] == pytest.approx(c["duration_s"], abs=0.01)
+        assert c["phases"]["tail"]["duration_s"] == pytest.approx(0.0, abs=0.01)
 
     def test_empty_input(self):
         analysis = power_cycles.analyze_cycles([])
@@ -147,28 +217,24 @@ class TestLandmarks:
 
 
 class TestOverlay:
-    def test_overlay_synchronizes_on_trigger(self):
+    def test_overlay_synchronizes_on_cycle_start(self):
         pts = []
-        for i, wlan_s in enumerate((0.8, 2.5)):
+        for wlan_s in (0.8, 2.5):
             p = _synthetic_profile(wlan_s)
-            offset = (pts[-1][0] + 2.0) if pts else 0.0
+            offset = (pts[-1][0] + 5.0) if pts else 0.0
             pts += [(t + offset, ma) for t, ma in p]
         overlay = power_cycles.build_overlay(_measurements(pts), limit=10)
         assert len(overlay["cycles"]) == 2
         for c in overlay["cycles"]:
-            # t=0 ist immer der Trigger: erster Sample ist Wake-Spike.
+            # t=0 ist immer der Zyklusanfang (Grundlast-Vorlauf).
             assert c["t_s"][0] == pytest.approx(0.0, abs=0.01)
-            assert c["ma"][0] == pytest.approx(150.0, abs=1.0)
-            # Phasen relativ zum Trigger.
-            assert c["phases"]["wake"]["start_s"] == pytest.approx(0.0, abs=0.01)
+            assert c["ma"][0] == pytest.approx(74.5, abs=1.0)
+            # Trigger liegt bei pre_peak_s = 5 s.
+            assert c["landmarks"]["trigger"]["start_s"] == pytest.approx(5.0, abs=0.01)
 
     def test_overlay_limit(self):
-        pts = []
-        for i in range(5):
-            p = _synthetic_profile(0.8)
-            offset = (pts[-1][0] + 2.0) if pts else 0.0
-            pts += [(t + offset, ma) for t, ma in p]
-        overlay = power_cycles.build_overlay(_measurements(pts), limit=3)
+        overlay = power_cycles.build_overlay(
+            _measurements(_profile_chain(5)), limit=3)
         assert len(overlay["cycles"]) == 3
 
 
@@ -185,70 +251,64 @@ class TestEdgeCases:
         samples = power_cycles._prepare_samples(rows)
         assert samples == [(0.0, 150.0)]
 
-    def test_sustained_run_too_short_continues_search(self):
-        # Kurzlauf ueber trigger (0.05 s < sustain 0.1 s), dann spaeter ein
-        # ausreichend langer Lauf -> Landmark muss beim zweiten liegen.
-        dt = 0.005
-        pts = [(i * dt, 10.0) for i in range(400)]          # 2 s Ruhe
-        pts += [((2.0 + i * dt), 150.0) for i in range(10)]  # 0.05 s kurz
-        pts += [((2.05 + i * dt), 10.0) for i in range(100)]  # 0.5 s Ruhe
-        pts += [((2.55 + i * dt), 150.0) for i in range(40)]  # 0.2 s lang
-        landmarks_cfg = (("x", 100.0, 0.1),)
-        lm = power_cycles.extract_landmarks(
-            power_cycles._prepare_samples(_measurements(pts)), 0, len(pts) - 1,
-            landmarks_cfg,
-        )
-        assert lm["x"]["start_s"] == pytest.approx(2.55, abs=0.01)
+    def test_negative_current_clamped_to_zero(self):
+        samples = power_cycles._prepare_samples(
+            [{"measured_at": _iso(0.0), "current_ma": -12.0}])
+        assert samples == [(0.0, 0.0)]
 
-    def test_truncated_cycle_at_max_duration(self):
-        # Daueraktivitaet > max_cycle_s -> wird in max_cycle_s-Bloecke geschnitten.
-        dt = 0.005
-        pts = [((i * dt), 60.0) for i in range(int(300 / dt))]  # 300 s aktiv
-        samples = power_cycles._prepare_samples(_measurements(pts))
-        cycles = power_cycles.segment_cycles(samples, max_cycle_s=120.0)
-        assert len(cycles) >= 2
-        assert cycles[0]["truncated"]
-        assert samples[cycles[0]["end_idx"]][0] == pytest.approx(120.005, abs=0.01)
-
-    def test_stream_ends_after_trigger_without_quiet(self):
-        # Stream endet direkt nach dem Trigger (keine Ruhe mehr) -> Zyklus
-        # bis zum letzten Sample, Ruhe-Abschneiden greift nicht.
-        pts = [(0.0, 0.1), (0.005, 150.0), (0.01, 150.0)]
+    def test_trigger_before_pre_window_clamps_to_stream_start(self):
+        # Trigger frueher als pre_peak_s nach Streambeginn -> Zyklus startet
+        # trotzdem am Streamanfang (kein negativer Index).
+        pts = [((i * 0.005), 150.0) for i in range(40)]
         samples = power_cycles._prepare_samples(_measurements(pts))
         cycles = power_cycles.segment_cycles(samples)
         assert len(cycles) == 1
-        assert cycles[0]["end_idx"] == 2
+        assert cycles[0]["start_idx"] == 0
 
-    def test_no_spike_end_within_cycle(self):
-        # Aktiver Zyklus, der NIE unter spike_end_ma faellt -> kein spike_end-
-        # Landmark; wake_end faellt auf den naechsten Landmark (wlan/send).
-        dt = 0.005
-        pts = [((i * dt), 120.0) for i in range(int(2.0 / dt))]
-        analysis = power_cycles.analyze_cycles(_measurements(pts))
-        c = analysis["cycles"][0]
-        assert c["landmarks"]["spike_end"] is None
-        assert c["phases"]["wake"]["end_s"] == pytest.approx(
-            c["phases"]["wlan"]["start_s"], abs=0.01
-        )
-        assert c["phases"]["measure"]["duration_s"] == pytest.approx(0.0, abs=0.01)
+    def test_last_cycle_not_truncated_when_short(self):
+        # Letzter Zyklus kuerzer als max_cycle_s -> nicht abgeschnitten.
+        pts = _synthetic_profile()
+        samples = power_cycles._prepare_samples(_measurements(pts))
+        cycles = power_cycles.segment_cycles(samples)
+        assert not cycles[0]["truncated"]
+
+    def test_gap_threshold_override(self):
+        # gap_s=0.001 -> jedes 5-ms-Raster gilt als Loch.
+        samples = power_cycles._prepare_samples(_measurements(_synthetic_profile()))
+        cycles = power_cycles.segment_cycles(samples, gap_s=0.001)
+        assert cycles[0]["gap"]
 
     def test_charge_ignores_degenerate_timesteps(self):
         # Doppelte Zeitstempel (dt <= 0, z. B. nach Uhr-Korrektur) tragen
         # NICHT zur Ladung bei: nur ein 5-ms-Intervall zaehlt.
-        pts = [(0.0, 100.0), (0.005, 100.0), (0.005, 100.0)]
+        pts = [(0.0, 120.0), (0.005, 120.0), (0.005, 120.0)]
         analysis = power_cycles.analyze_cycles(_measurements(pts))
         c = analysis["cycles"][0]
-        # 100 mA * 0.005 s = 0.5 mAs -> /3.6 = 0.1389 uAh (nicht das Doppelte)
-        assert c["charge_uah"] == pytest.approx(0.1389, abs=0.001)
+        # 120 mA * 0.005 s = 0.6 mAs -> /3.6 = 0.1667 uAh (nicht das Doppelte)
+        assert c["charge_uah"] == pytest.approx(0.1667, abs=0.001)
 
-    def test_stream_ends_mid_quiet_trims_tail(self):
-        # Stream endet nach dem Trigger MIT kurzer Schluss-Ruhe (< min_quiet_s,
-        # kein Datenloch) -> angehaengte Ruhe-Samples werden abgeschnitten.
-        dt = 0.005
-        pts = [((i * dt), 150.0) for i in range(20)]          # 0.1 s Spike
-        pts += [((0.1 + i * dt), 0.1) for i in range(200)]    # 1 s Ruhe (< 2 s)
-        samples = power_cycles._prepare_samples(_measurements(pts))
-        cycles = power_cycles.segment_cycles(samples)
-        assert len(cycles) == 1
-        end_t = samples[cycles[0]["end_idx"]][0]
-        assert end_t == pytest.approx(0.095, abs=0.01)  # Ruhe entfernt
+    def test_charge_skips_data_gap(self):
+        # 6-s-Loch mitten im Zyklus -> der integrates Schritt wird uebersprungen.
+        pts = [(t, ma) for t, ma in _synthetic_profile() if t < 6.0]
+        pts += [(t + 6.0, ma) for t, ma in _synthetic_profile() if t >= 6.0]
+        analysis = power_cycles.analyze_cycles(_measurements(pts))
+        assert analysis["cycles"][0]["gap"]
+        # Grundlast ohne den 6-s-Sprung waere ~74.5 mA * 10 s / 3.6 = 207 uAh;
+        # das Loch darf nichts dazuzzaehlen.
+        assert analysis["cycles"][0]["charge_uah"] < 300.0
+
+    def test_stats_skips_truncated_cycles(self):
+        # Nur ein truncated-Zyklus -> keine Phasen-Statistik.
+        pts = [((i * 0.005), 150.0) for i in range(int(300 / 0.005))]
+        analysis = power_cycles.analyze_cycles(
+            _measurements(pts), refractory_s=400.0)
+        assert analysis["stats"] == {}
+
+    def test_analyze_cycles_kwargs_forwarded(self):
+        # Alle Parameter muessen von analyze_cycles angenommen werden
+        # (Durchreichen aus main.py).
+        samples = _measurements(_synthetic_profile())
+        a = power_cycles.analyze_cycles(
+            samples, peak_trigger_ma=100.0, pre_peak_s=1.0, refractory_s=2.0,
+            spike_end_ma=85.0, max_cycle_s=60.0, gap_s=5.0)
+        assert len(a["cycles"]) == 1

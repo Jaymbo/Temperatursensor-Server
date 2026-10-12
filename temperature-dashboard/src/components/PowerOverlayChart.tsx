@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useRef, useEffect } from "react";
 import {
   Chart as ChartJS,
   LineElement,
@@ -10,26 +10,31 @@ import {
   type ChartData,
   type ChartOptions,
 } from "chart.js";
+import zoomPlugin from "chartjs-plugin-zoom";
 import { Line } from "react-chartjs-2";
 import { POWER_PHASE_ORDER, type PowerCycle } from "../hooks/usePowerData";
 
-ChartJS.register(LineElement, PointElement, LinearScale, Title, Tooltip, Legend);
+ChartJS.register(LineElement, PointElement, LinearScale, Title, Tooltip, Legend,
+  zoomPlugin);
 
 /**
  * Oszilloskop-Overlay: alle Zyklen uebereinander, synchronisiert auf t=0
- * (Zyklusanfang = Trigger auf den Stromanstieg). Landmarks als vertikale
- * Referenzlinien-Anker (Punkte auf der ersten Kurve), Phasen-Dauern stehen
- * in der Tabelle darunter (min/median/max ueber alle Zyklen).
+ * (Zyklusanfang = Trigger - 5 s Vorlauf). Landmarks als Referenz-Punkte auf
+ * der Kurve, Phasen-Dauern stehen in der Tabelle darunter (min/median/max
+ * ueber alle Zyklen).
  *
  * Bewusst keine TimeScale: die x-Achse ist die Zeit SEIT Trigger in Sekunden,
  * nicht die Absolutezeit (deshalb funktioniert das Ueberlagern ueberhaupt).
+ *
+ * Zoom/Pan (chartjs-plugin-zoom, Muster wie im Haupt-Chart):
+ *   - Mausrad = x-Zoom, Drag = Pan
+ *   - Esc = Zoom zuruecksetzen
  */
 
 const PHASE_LABEL: Record<string, string> = {
-  wake: "Wake-Spike",
-  measure: "Messung",
-  wlan: "WLAN-Connect",
-  send_tail: "Senden",
+  pre_peak: "Grundlast (Vorlauf)",
+  spike: "TX-Burst",
+  tail: "Rest",
 };
 
 const CYCLE_COLORS = [
@@ -38,10 +43,8 @@ const CYCLE_COLORS = [
 ];
 
 const LANDMARK_LABEL: Record<string, string> = {
-  wake: "Trigger",
-  spike_end: "Spike-Ende",
-  wlan: "WLAN-Start",
-  send: "Send-Start",
+  trigger: "Trigger (Peak)",
+  spike_end: "Burst-Ende",
 };
 
 interface Props {
@@ -50,6 +53,16 @@ interface Props {
 }
 
 export const PowerOverlayChart = ({ cycles, height = "45vh" }: Props) => {
+  const chartRef = useRef<any>(null);
+
+  // Esc = Zoom zuruecksetzen (wie im Haupt-Chart).
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") chartRef.current?.resetZoom?.();
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, []);
   const chartData = useMemo<ChartData<"line">>(() => {
     const datasets: ChartData<"line">["datasets"] = [];
 
@@ -98,7 +111,7 @@ export const PowerOverlayChart = ({ cycles, height = "45vh" }: Props) => {
     scales: {
       x: {
         type: "linear" as const,
-        title: { display: true, text: "Zeit seit Trigger (s)" },
+        title: { display: true, text: "Zeit seit Zyklusanfang (s)" },
         min: 0,
         max: maxT,
       },
@@ -112,6 +125,17 @@ export const PowerOverlayChart = ({ cycles, height = "45vh" }: Props) => {
       tooltip: {
         callbacks: {
           label: (ctx) => `${Number(ctx.parsed.y).toFixed(1)} mA @ t=${Number(ctx.parsed.x).toFixed(3)} s`,
+        },
+      },
+      zoom: {
+        zoom: {
+          wheel: { enabled: true },
+          pinch: { enabled: true },
+          mode: "x" as const,
+        },
+        pan: {
+          enabled: true,
+          mode: "x" as const,
         },
       },
     },
@@ -128,11 +152,12 @@ export const PowerOverlayChart = ({ cycles, height = "45vh" }: Props) => {
   return (
     <div>
       <div style={{ height }}>
-        <Line data={chartData} options={options} />
+        <Line ref={chartRef} data={chartData} options={options} />
       </div>
-      {/* Phasen-Legende: Label-Zuordnung der Landmarks */}
+      {/* Bedien-Hinweis + Phasen-Legende: Label-Zuordnung der Landmarks */}
       <div style={{ fontSize: "1.6vh", color: "#666", marginTop: 4 }}>
-        Phasen: {POWER_PHASE_ORDER.map((p) => `${PHASE_LABEL[p] ?? p}`).join(" → ")}
+        Mausrad = Zoom, Ziehen = Verschieben, Esc = Zurücksetzen · Phasen:{" "}
+        {POWER_PHASE_ORDER.map((p) => `${PHASE_LABEL[p] ?? p}`).join(" → ")}
       </div>
     </div>
   );

@@ -52,7 +52,7 @@ export interface PowerSessionSummary {
 }
 
 /** Reihenfolge der Phasen fuer die Tabelle (wie im Backend definiert). */
-export const POWER_PHASE_ORDER = ["wake", "measure", "wlan", "send_tail"] as const;
+export const POWER_PHASE_ORDER = ["pre_peak", "spike", "tail"] as const;
 
 export const usePowerData = () => {
   const [loggers, setLoggers] = useState<string[]>([]);

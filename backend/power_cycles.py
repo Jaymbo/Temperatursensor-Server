@@ -1,17 +1,24 @@
 """Zyklus-Erkennung und Oszilloskop-Overlay fuer die Strommessung.
 
 Der Mess-ESP (Wemos D1 mini + INA226) streamt ROHPROBEN (Dauerstream @ 200 Hz).
-Diese Modul leitet daraus OSZILLOSKOP-ARTIG die Messzyklen des Loggers ab:
+Diese Modul leitet daraus OSZILLOSKOP-ARTIG die Messzyklen des Loggers ab.
 
-  * Segmentierung: Ein Zyklus beginnt, wenn der Strom ueber den Trigger-Schwellwert
-    steigt (Logger wacht auf) und endet, wenn der Strom fuer min_quiet_s unter
-    dem Ruhe-Schwellwert bleibt (Logger schlaeft).
-  * Landmarks: Phasen-Grenzen innerhalb eines Zyklus (Wake, WLAN-Connect,
-    HTTP-Send) werden ueber Stromschwellen erkannt. Die Dauern von-bis zeigen,
-    WELCHER TEIL WIE LANGE BRAUCHT - z. B. "WLAN-Connect dauert meist 0,8 s,
-    aber 2,3 s wenn der Server beim 1. Versuch nicht antwortet".
-  * Overlay: Alle Zyklen werden auf t=0 (Trigger) synchronisiert, damit sie wie
-    am Oszilloskop uebereinander gelegt werden koennen.
+Zyklus-Definition (peak-basiert, kalibriert an echten Daten: Der gemessene
+Logger zieht dauerhaft ~74 mA Grundlast - eine "Ruhe"-Erkennung unter 2 mA
+kommt nie zustande und wuerde jeden Zyklus an max_cycle_s abschneiden):
+
+  * Trigger  : ERSTES Sample, das peak_trigger_ma ueberschreitet (ein Sample
+               reicht - der TX-Burst IST das Signal). Danach gilt fuer
+               refractory_s KEIN neuer Trigger (Debounce, damit der Peak-Lauf
+               von bis zu ~2 s nicht mehrfach zaehlt).
+  * Zyklus   : startet pre_peak_s VOR dem Trigger (Vorlauf-Fenster) und endet
+               pre_peak_s vor dem naechsten Trigger. Der letzte Zyklus laeuft
+               bis zum Streamende (Deckel max_cycle_s, dann truncated).
+  * Landmarks: trigger (der >-Moment) und spike_end (erster Fall unter
+               spike_end_ma nach dem Trigger = Ende des TX-Bursts).
+  * Phasen   : pre_peak (Grundlast-Vorlauf), spike (TX-Burst), tail (Rest).
+  * Overlay  : Alle Zyklen werden auf t=0 (Zyklusanfang) synchronisiert, damit
+               sie wie am Oszilloskop uebereinander gelegt werden koennen.
 
 Die Erkennung ist bewusst SCHWELLEN-BASIERT und wird an echten Messdaten
 kalibriert (Schwellwerte sind Parameter mit Defaults). Wie bei battery_health
@@ -22,30 +29,16 @@ jederzeit aenderbar.
 from __future__ import annotations
 
 import datetime
-import math
 import statistics
 
-# --- Defaults (an echten Daten kalibrieren; alle Endpoints uebernehmen sie) ---
-DEFAULT_TRIGGER_MA = 5.0     # Stromanstieg = Logger wacht auf
-DEFAULT_QUIET_MA = 2.0       # darunter gilt: schlaeft
-DEFAULT_MIN_QUIET_S = 2.0    # so lange ruhig -> Zyklus ist vorbei
-DEFAULT_MAX_CYCLE_S = 120.0  # laenger = abgeschnitten (kein Schlaf erkannt)
-DEFAULT_GAP_S = 5.0          # Loch im Stream beendet den Zyklus
-DEFAULT_SPIKE_END_MA = 40.0  # darunter: Wake-Spike vorbei (Messphase)
-
-# Landmark-Schwellen: (Name, Schwelle mA, Sustain-Dauer s)
-#   wake : erster Anstieg ueber trigger (kein Sustain - der Spike IST das Signal)
-#   spike_end : Strom faellt unter spike_end_ma NACH dem Wake-Spike -> Messphase
-#               (wird NICHT als >-Schwelle gesucht, sondern als Fall unter die
-#                Schwelle; siehe _spike_end_idx)
-#   wlan : nachhaltig ueber 40 mA (Radio an, Connect-Phase)
-#   send : nachhaltig ueber 80 mA (TX-Burst beim HTTP-Post)
-DEFAULT_LANDMARKS = (
-    ("wake", DEFAULT_TRIGGER_MA, 0.0),
-    ("spike_end", DEFAULT_SPIKE_END_MA, 0.0),   # Spezialfall: Fall unter Schwelle
-    ("wlan", 40.0, 0.1),
-    ("send", 80.0, 0.1),
-)
+# --- Defaults (an echten Daten kalibriert; alle Endpoints uebernehmen sie) ---
+DEFAULT_PEAK_TRIGGER_MA = 100.0  # Trigger = erste Ueberschreitung (TX-Burst)
+DEFAULT_PRE_PEAK_S = 5.0         # Zyklus startet so viel VOR dem Trigger
+DEFAULT_REFRACTORY_S = 10.0      # nach einem Trigger kein neuer Peak-Trigger
+DEFAULT_SPIKE_END_MA = 85.0      # darunter: TX-Burst vorbei (zwischen
+                                 # Grundlast ~74 mA und Peak ~135 mA)
+DEFAULT_MAX_CYCLE_S = 120.0      # Deckel fuer den UNTERBROCHENEN letzten Zyklus
+DEFAULT_GAP_S = 5.0              # Datenloch im Zyklusfenster -> gap-Markierung
 
 
 def _parse_iso(value):
@@ -77,99 +70,83 @@ def _prepare_samples(measurements: list[dict]) -> list[tuple[float, float]]:
     return out
 
 
-def _sustained_above(
+def _find_trigger_indices(
     samples: list[tuple[float, float]],
-    start_idx: int,
-    end_idx: int,
-    threshold_ma: float,
-    sustain_s: float,
-) -> int | None:
+    peak_trigger_ma: float,
+    refractory_s: float,
+) -> list[int]:
     """
-    Ersten Index >= start_idx, dessen Strom AB DAUER ueber threshold_ma liegt
-    (fuer >= sustain_s zusammenhaengend, bei sustain_s=0 reicht ein Sample).
-    @return Index oder None.
+    Indizes aller Peak-Trigger: erstes Sample ueber peak_trigger_ma, danach
+    fuer refractory_s gesperrt (Debounce - der Peak-Lauf zaehlt nur einmal).
     """
-    i = start_idx
-    while i <= end_idx:
-        if samples[i][1] > threshold_ma:
-            # Ende des zusammenhaengenden Laufs ueber der Schwelle finden.
-            j = i
-            while j <= end_idx and samples[j][1] > threshold_ma:
-                j += 1
-            run_s = samples[j - 1][0] - samples[i][0]
-            if sustain_s <= 0.0 or run_s >= sustain_s:
-                return i
-            i = j                     # Lauf zu kurz -> danach weitersuchen
-        else:
-            i += 1
-    return None
+    triggers: list[int] = []
+    refractory_until = None
+    for i, (t, ma) in enumerate(samples):
+        if ma > peak_trigger_ma and (refractory_until is None or t >= refractory_until):
+            triggers.append(i)
+            refractory_until = t + refractory_s
+    return triggers
 
 
 def segment_cycles(
     samples: list[tuple[float, float]],
-    trigger_ma: float = DEFAULT_TRIGGER_MA,
-    quiet_ma: float = DEFAULT_QUIET_MA,
-    min_quiet_s: float = DEFAULT_MIN_QUIET_S,
+    peak_trigger_ma: float = DEFAULT_PEAK_TRIGGER_MA,
+    pre_peak_s: float = DEFAULT_PRE_PEAK_S,
+    refractory_s: float = DEFAULT_REFRACTORY_S,
     max_cycle_s: float = DEFAULT_MAX_CYCLE_S,
     gap_s: float = DEFAULT_GAP_S,
 ) -> list[dict]:
     """
-    Segmentiert den Stromverlauf in Zyklen.
+    Segmentiert den Stromverlauf peak-basiert in Zyklen.
 
-    Ein Zyklus startet am ersten Sample ueber trigger_ma nach einer Ruhephase
-    und endet, wenn der Strom fuer >= min_quiet_s unter quiet_ma bleibt, ein
-    Datenloch > gap_s auftritt oder max_cycle_s erreicht ist.
+    Ein Zyklus startet pre_peak_s vor seinem Trigger und endet pre_peak_s vor
+    dem naechsten Trigger; der letzte Zyklus laeuft bis zum Streamende (bei
+    laenger als max_cycle_s: abgeschnitten, truncated=True). Ein Datenloch
+    > gap_s INNERHALB des Zyklusfensters wird als gap markiert (die Ladungs-
+    Integration ueberspringt solche Schritte bereits).
 
-    @return Liste von {start_idx, end_idx, truncated, gap}
+    @return Liste von {start_idx, end_idx, trigger_idx, truncated, gap}
     """
+    triggers = _find_trigger_indices(samples, peak_trigger_ma, refractory_s)
     cycles: list[dict] = []
-    n = len(samples)
-    i = 0
-    while i < n:
-        # Ruhephase bis zum naechsten Trigger ueberspringen.
-        if samples[i][1] <= trigger_ma:
-            i += 1
-            continue
-        start = i
-        end = i
+    for k, trig_idx in enumerate(triggers):
+        t_start = samples[trig_idx][0] - pre_peak_s
+        # ersten Sample im Vorlauf-Fenster suchen (nicht vor dem Streamanfang)
+        start_idx = trig_idx
+        while start_idx > 0 and samples[start_idx - 1][0] >= t_start:
+            start_idx -= 1
+
         truncated = False
-        gap = False
-        quiet_start = None          # Zeitpunkt, seit dem durchgehend ruhig
-        j = i
-        while j < n:
-            t = samples[j][0]
-            if t - samples[start][0] > max_cycle_s:
-                truncated = True
-                end = j
-                break
-            if j > 0 and (t - samples[j - 1][0]) > gap_s:
-                # Datenloch (z. B. Sende-Pause des Mess-ESP) beendet den Zyklus.
-                # end = Sample VOR dem Loch; nie unter den Trigger fallen lassen
-                # (sonst end < start -> i = end + 1 bleibt beim selben Trigger
-                # haengen).
-                gap = True
-                end = max(start, j - 1)
-                break
-            if samples[j][1] > quiet_ma:
-                end = j
-                quiet_start = None
-            elif quiet_start is None:
-                quiet_start = t
-            if quiet_start is not None and (t - quiet_start) >= min_quiet_s:
-                break               # Zyklus vorbei: Ruhe >= min_quiet_s
-            j += 1
+        if k + 1 < len(triggers):
+            # Ende: letzter Sample VOR dem Start des naechsten Zyklus.
+            t_next_start = samples[triggers[k + 1]][0] - pre_peak_s
+            end_idx = triggers[k + 1]
+            while end_idx > start_idx and samples[end_idx][0] >= t_next_start:
+                end_idx -= 1
         else:
-            end = j - 1
-        # Ruhe am Ende abschneiden (Stream endete mitten in der Schluss-Ruhe):
-        while end > start and samples[end][1] <= quiet_ma:
-            end -= 1
+            # Letzter (ggf. unvollstaendiger) Zyklus: bis zum Streamende,
+            # mit max_cycle_s als Deckel gegen "Peak hoert nie auf".
+            end_idx = len(samples) - 1
+            if samples[end_idx][0] - samples[start_idx][0] > max_cycle_s:
+                truncated = True
+                end_idx = start_idx
+                while (end_idx + 1 < len(samples)
+                       and samples[end_idx + 1][0] - samples[start_idx][0] <= max_cycle_s):
+                    end_idx += 1
+
+        gap = False
+        for j in range(start_idx + 1, end_idx + 1):
+            if samples[j][0] - samples[j - 1][0] > gap_s:
+                gap = True
+                break
+
         cycles.append({
-            "start_idx": start,
-            "end_idx": end,
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "trigger_idx": trig_idx,
             "truncated": truncated,
             "gap": gap,
         })
-        i = end + 1
     return cycles
 
 
@@ -180,8 +157,8 @@ def _spike_end_idx(
     spike_end_ma: float,
 ) -> int | None:
     """
-    Ende des Wake-Spike-Laufs: erster Index >= start_idx, dessen Strom UNTER
-    spike_end_ma faellt (Spike vorbei, Messphase laeuft). @return Index oder None.
+    Ende des TX-Bursts: erster Index >= start_idx, dessen Strom UNTER
+    spike_end_ma faellt (Burst vorbei). @return Index oder None.
     """
     for i in range(start_idx, end_idx + 1):
         if samples[i][1] < spike_end_ma:
@@ -193,56 +170,50 @@ def extract_landmarks(
     samples: list[tuple[float, float]],
     start_idx: int,
     end_idx: int,
-    landmarks: tuple = DEFAULT_LANDMARKS,
+    trigger_idx: int,
     spike_end_ma: float = DEFAULT_SPIKE_END_MA,
 ) -> dict:
     """
-    Erkennt die Phasen-Grenzen (Landmarks) innerhalb eines Zyklus.
+    Landmarks eines Zyklus (t relativ zum Zyklusanfang, t0 = Trigger - pre).
 
-    @return {name: {"start_s": t, "idx": i} | None, ...} mit t relativ zum
-            Zyklusstart (t=0 = Trigger).
+    trigger  : der Peak-Trigger selbst (wird aus der Segmentierung uebernommen,
+               nicht neu gesucht)
+    spike_end: erster Fall unter spike_end_ma nach dem Trigger (None, wenn der
+               Strom bis zum Zyklusende darueber bleibt)
     """
     t0 = samples[start_idx][0]
-    out: dict = {}
-    search_from = start_idx
-    for name, threshold_ma, sustain_s in landmarks:
-        idx = None
-        if search_from <= end_idx:
-            if name == "spike_end":
-                # Spezialfall: kein >-Schwellwert, sondern der erste Fall unter
-                # spike_end_ma nach dem Wake-Spike.
-                idx = _spike_end_idx(samples, search_from, end_idx, spike_end_ma)
-            else:
-                idx = _sustained_above(samples, search_from, end_idx, threshold_ma, sustain_s)
-        if idx is None:
-            out[name] = None
-        else:
-            out[name] = {"start_s": samples[idx][0] - t0, "idx": idx}
-            search_from = idx + 1  # Landmarks kommen der Reihe nach
+    out: dict = {
+        "trigger": {"start_s": samples[trigger_idx][0] - t0, "idx": trigger_idx},
+    }
+    sp = _spike_end_idx(samples, trigger_idx, end_idx, spike_end_ma)
+    if sp is None:
+        out["spike_end"] = None
+    else:
+        out["spike_end"] = {"start_s": samples[sp][0] - t0, "idx": sp}
     return out
 
 
 def analyze_cycles(
     measurements: list[dict],
-    trigger_ma: float = DEFAULT_TRIGGER_MA,
-    quiet_ma: float = DEFAULT_QUIET_MA,
-    min_quiet_s: float = DEFAULT_MIN_QUIET_S,
+    peak_trigger_ma: float = DEFAULT_PEAK_TRIGGER_MA,
+    pre_peak_s: float = DEFAULT_PRE_PEAK_S,
+    refractory_s: float = DEFAULT_REFRACTORY_S,
+    spike_end_ma: float = DEFAULT_SPIKE_END_MA,
     max_cycle_s: float = DEFAULT_MAX_CYCLE_S,
     gap_s: float = DEFAULT_GAP_S,
-    landmarks_cfg: tuple = DEFAULT_LANDMARKS,
-    spike_end_ma: float = DEFAULT_SPIKE_END_MA,
 ) -> dict:
     """
     Vollanalyse: Segmentierung + Landmarks + Phasen-Dauern je Zyklus.
 
     @return {"cycles": [...], "stats": {...}} mit
       cycle = {
-        "start": ISO des Triggers, "duration_s": ...,
-        "peak_ma": ..., "charge_uah": ..., "truncated": ..., "gap": ...,
+        "start": ISO des Zyklusanfangs (Trigger - pre_peak_s),
+        "duration_s": ..., "peak_ma": ..., "charge_uah": ...,
+        "truncated": ..., "gap": ...,
         "landmarks": {name: {"start_s": ...} | None},
         "phases": {name: {"start_s": ..., "end_s": ..., "duration_s": ...}},
       }
-      stats = je Phase min/median/max der Dauer ueber alle Zyklen
+      stats = je Phase min/median/max der Dauer ueber alle vollstaendigen Zyklen
     """
     samples = _prepare_samples(measurements)
     if not samples:
@@ -254,7 +225,7 @@ def analyze_cycles(
         if t_base_iso is not None:
             break
 
-    segments = segment_cycles(samples, trigger_ma, quiet_ma, min_quiet_s,
+    segments = segment_cycles(samples, peak_trigger_ma, pre_peak_s, refractory_s,
                               max_cycle_s, gap_s)
     cycles: list[dict] = []
     for seg in segments:
@@ -272,33 +243,22 @@ def analyze_cycles(
             charge_ma_s += samples[i][1] * dt
         charge_uah = charge_ma_s / 3.6
 
-        lm = extract_landmarks(samples, s_idx, e_idx, landmarks_cfg,
+        lm = extract_landmarks(samples, s_idx, e_idx, seg["trigger_idx"],
                                spike_end_ma=spike_end_ma)
-        # Phasen (alle t relativ zum Trigger t0=0):
-        #   wake       : Trigger .. Ende des Wake-Spike-Laufs
-        #   measure    : Spike-Ende .. WLAN-Start (Messung/NAU7802, Strom moderat)
-        #   wlan       : WLAN-Start .. Send-Start (Radio an, Connect)
-        #   send_tail  : Send-Start .. Zyklusende (TX-Burst + Rest)
-        spike_end_lm = lm.get("spike_end")
-        if spike_end_lm is not None:
-            wake_end = spike_end_lm["start_s"]
-        elif lm.get("wlan") is not None:
-            wake_end = lm["wlan"]["start_s"]     # kein eindeutiger Spike-Ende
-        else:
-            wake_end = duration
-        wlan_start = lm["wlan"]["start_s"] if lm.get("wlan") else wake_end
-        wlan_start = max(wlan_start, wake_end)
-        send_start = lm["send"]["start_s"] if lm.get("send") else duration
-        send_start = max(send_start, wlan_start)
+        # Phasen (alle t relativ zum Zyklusanfang t0=0):
+        #   pre_peak : Zyklusanfang .. Trigger (Grundlast-Vorlauf)
+        #   spike    : Trigger .. Fall unter spike_end_ma (TX-Burst)
+        #   tail     : Spike-Ende .. Zyklusende
+        trigger_s = lm["trigger"]["start_s"]
+        spike_end_s = lm["spike_end"]["start_s"] if lm["spike_end"] else duration
+        spike_end_s = max(spike_end_s, trigger_s)
         phases = {
-            "wake": {"start_s": 0.0, "end_s": wake_end,
-                     "duration_s": wake_end},
-            "measure": {"start_s": wake_end, "end_s": wlan_start,
-                        "duration_s": wlan_start - wake_end},
-            "wlan": {"start_s": wlan_start, "end_s": send_start,
-                     "duration_s": send_start - wlan_start},
-            "send_tail": {"start_s": send_start, "end_s": duration,
-                          "duration_s": duration - send_start},
+            "pre_peak": {"start_s": 0.0, "end_s": trigger_s,
+                         "duration_s": trigger_s},
+            "spike": {"start_s": trigger_s, "end_s": spike_end_s,
+                      "duration_s": spike_end_s - trigger_s},
+            "tail": {"start_s": spike_end_s, "end_s": duration,
+                     "duration_s": duration - spike_end_s},
         }
 
         start_iso = None
@@ -330,7 +290,7 @@ def analyze_cycles(
     # Statistik je Phase: min/median/max der Dauern (nur vollstaendige Zyklen).
     stats: dict = {}
     full = [c for c in cycles if not c["truncated"]]
-    for name in ("wake", "measure", "wlan", "send_tail"):
+    for name in ("pre_peak", "spike", "tail"):
         durs = [c["phases"][name]["duration_s"] for c in full]
         if durs:
             stats[name] = {
@@ -444,8 +404,8 @@ def build_overlay(
     **kwargs,
 ) -> dict:
     """
-    Oszilloskop-Overlay: die letzten `limit` Zyklen, alle auf t=0 (Trigger)
-    synchronisiert.
+    Oszilloskop-Overlay: die letzten `limit` Zyklen, alle auf t=0
+    (Zyklusanfang = Trigger - pre_peak_s) synchronisiert.
 
     @return {"cycles": [{start, duration_s, landmarks, t_s: [...], ma: [...]}]}
     """

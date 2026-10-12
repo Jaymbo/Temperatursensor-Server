@@ -1039,6 +1039,23 @@ def assign_battery(payload: dict):
     return {"status": "success", "assignment": get_battery_assignment(sensor_id)}
 
 
+def _power_cycle_kwargs(
+    peak_trigger_ma: float | None = None,
+    pre_peak_s: float | None = None,
+    refractory_s: float | None = None,
+    spike_end_ma: float | None = None,
+    max_cycle_s: float | None = None,
+    gap_s: float | None = None,
+) -> dict:
+    """Nur gesetzte Schwellwert-Parameter an die Analyse durchreichen."""
+    names = ("peak_trigger_ma", "pre_peak_s", "refractory_s", "spike_end_ma",
+             "max_cycle_s", "gap_s")
+    return {n: v for n, v in zip(names, (peak_trigger_ma, pre_peak_s,
+                                          refractory_s, spike_end_ma,
+                                          max_cycle_s, gap_s))
+            if v is not None}
+
+
 # ── Strommessung (Mess-ESP mit INA226) ───────────────────────────
 
 
@@ -1134,9 +1151,10 @@ def power_cycles_endpoint(
     logger_id: str,
     since: str | None = None,
     limit: int | None = None,
-    trigger_ma: float | None = None,
-    quiet_ma: float | None = None,
-    min_quiet_s: float | None = None,
+    peak_trigger_ma: float | None = None,
+    pre_peak_s: float | None = None,
+    refractory_s: float | None = None,
+    spike_end_ma: float | None = None,
     max_cycle_s: float | None = None,
     gap_s: float | None = None,
 ):
@@ -1147,17 +1165,8 @@ def power_cycles_endpoint(
     per Query-Parameter angepasst werden (Defaults siehe power_cycles.py).
     """
     measurements = get_power_measurements(logger_id, since=since, limit=limit)
-    kwargs = {}
-    if trigger_ma is not None:
-        kwargs["trigger_ma"] = trigger_ma
-    if quiet_ma is not None:
-        kwargs["quiet_ma"] = quiet_ma
-    if min_quiet_s is not None:
-        kwargs["min_quiet_s"] = min_quiet_s
-    if max_cycle_s is not None:
-        kwargs["max_cycle_s"] = max_cycle_s
-    if gap_s is not None:
-        kwargs["gap_s"] = gap_s
+    kwargs = _power_cycle_kwargs(peak_trigger_ma, pre_peak_s, refractory_s,
+                                 spike_end_ma, max_cycle_s, gap_s)
     return power_cycles.analyze_cycles(measurements, **kwargs)
 
 
@@ -1166,9 +1175,10 @@ def power_sessions_endpoint(
     logger_id: str,
     since: str | None = None,
     limit: int | None = None,
-    trigger_ma: float | None = None,
-    quiet_ma: float | None = None,
-    min_quiet_s: float | None = None,
+    peak_trigger_ma: float | None = None,
+    pre_peak_s: float | None = None,
+    refractory_s: float | None = None,
+    spike_end_ma: float | None = None,
     max_cycle_s: float | None = None,
     gap_s: float | None = None,
 ):
@@ -1183,17 +1193,8 @@ def power_sessions_endpoint(
     """
     measurements = get_power_measurements(logger_id, since=since, limit=limit)
     sessions = db.get_sessions_chronological()
-    kwargs = {}
-    if trigger_ma is not None:
-        kwargs["trigger_ma"] = trigger_ma
-    if quiet_ma is not None:
-        kwargs["quiet_ma"] = quiet_ma
-    if min_quiet_s is not None:
-        kwargs["min_quiet_s"] = min_quiet_s
-    if max_cycle_s is not None:
-        kwargs["max_cycle_s"] = max_cycle_s
-    if gap_s is not None:
-        kwargs["gap_s"] = gap_s
+    kwargs = _power_cycle_kwargs(peak_trigger_ma, pre_peak_s, refractory_s,
+                                 spike_end_ma, max_cycle_s, gap_s)
     return power_cycles.analyze_cycles_by_session(measurements, sessions, **kwargs)
 
 
@@ -1203,29 +1204,21 @@ def power_cycles_overlay_endpoint(
     since: str | None = None,
     limit: int | None = None,
     overlay_limit: int = 20,
-    trigger_ma: float | None = None,
-    quiet_ma: float | None = None,
-    min_quiet_s: float | None = None,
+    peak_trigger_ma: float | None = None,
+    pre_peak_s: float | None = None,
+    refractory_s: float | None = None,
+    spike_end_ma: float | None = None,
     max_cycle_s: float | None = None,
     gap_s: float | None = None,
 ):
     """
     Oszilloskop-Overlay: die letzten `overlay_limit` Zyklen, alle auf t=0
-    (Zyklusanfang/Trigger) synchronisiert, inkl. Landmarks und Phasen.
+    (Zyklusanfang) synchronisiert, inkl. Landmarks und Phasen.
     """
     # Wichtig: fuer die Overlay-Ansicht die VOLLSTAENDIGEN Rohdaten nehmen,
     # damit die letzten Zyklen nicht durch ein kleines Daten-Limit beschnitten
     # werden (limit ist hier bewusst nur ein Analyse-Deckel).
     measurements = get_power_measurements(logger_id, since=since, limit=limit)
-    kwargs = {}
-    if trigger_ma is not None:
-        kwargs["trigger_ma"] = trigger_ma
-    if quiet_ma is not None:
-        kwargs["quiet_ma"] = quiet_ma
-    if min_quiet_s is not None:
-        kwargs["min_quiet_s"] = min_quiet_s
-    if max_cycle_s is not None:
-        kwargs["max_cycle_s"] = max_cycle_s
-    if gap_s is not None:
-        kwargs["gap_s"] = gap_s
+    kwargs = _power_cycle_kwargs(peak_trigger_ma, pre_peak_s, refractory_s,
+                                 spike_end_ma, max_cycle_s, gap_s)
     return power_cycles.build_overlay(measurements, limit=overlay_limit, **kwargs)
