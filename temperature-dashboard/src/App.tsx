@@ -11,6 +11,7 @@ import { useBatteryData, type BatteryHistory } from "./hooks/useBatteryData";
 import { usePowerData } from "./hooks/usePowerData";
 import { PowerOverlayChart } from "./components/PowerOverlayChart";
 import { PowerPhaseTable } from "./components/PowerPhaseTable";
+import { PowerSessionTable } from "./components/PowerSessionTable";
 import { buildApiUrl, getApiBase } from "./api";
 import { parseCorrectionPoints, type CorrectionPoint, localIso, buildActualTimestamp } from "./utils";
 
@@ -1023,6 +1024,8 @@ function App() {
                   <PowerOverlayChart cycles={power.cycles} />
                   <h4 style={{ margin: '16px 0 8px' }}>Phasen-Dauern (min / Median / max)</h4>
                   <PowerPhaseTable stats={power.stats} />
+                  <h4 style={{ margin: '16px 0 8px' }}>Verbrauch pro Session (Firmware-Versionsvergleich)</h4>
+                  <PowerSessionTable sessions={power.sessions} />
                 </>
               )
             ) : (

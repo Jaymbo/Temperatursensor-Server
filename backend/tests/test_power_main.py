@@ -138,3 +138,96 @@ def test_power_loggers_sorted_by_latest(client):
 
 def test_power_loggers_empty(client):
     assert client.get("/power/loggers").json() == {"loggers": []}
+
+
+# ── GET /power/sessions/{logger_id} (Firmware-Versionsvergleich) ─────────
+
+def _create_sessions(client, specs: list[tuple[str, str | None]]):
+    """
+    Legt Sessions an (ueber den existierenden Endpoint /update/{sensor_id} -
+    genau der Weg, wie auch die Firmware eine neue Version startet) und gibt
+    die neu erstellten Session-IDs zurueck.
+
+    specs: [(sensor_id, custom_text-oder-None), ...] in Reihenfolge.
+    """
+    import db as dbmod
+    out = []
+    for sensor_id, custom_text in specs:
+        if custom_text is not None:
+            client.post("/custom-text", json={"custom_text": custom_text})
+        res = client.post(f"/update/{sensor_id}").json()
+        session_id = int(res["new_sensor_session"].split("_", 1)[1])
+        out.append({"id": session_id, "sensor_id": sensor_id})
+    return out
+
+
+def test_power_sessions_assignment_and_summary(client):
+    # Zwei Sessions: Version A, dann Version B (neuere Firmware).
+    created = _create_sessions(client, [("1", None), (None, None)])
+    assert len(created) == 2
+    # Beide Zyklen liegen NACH beiden Session-Starts (Server setzt
+    # measured_at = Empfangszeit + Alter) -> alle gehoeren zur neuesten.
+    _post_samples(client, "1", _profile_chain(2))
+
+    data = client.get("/power/sessions/1").json()
+    assert len(data["cycles"]) == 2
+    assert all("session_id" in c for c in data["cycles"])
+    assert all(c["session_id"] == created[-1]["id"] for c in data["cycles"])
+
+    # Zusammenfassung: eine Gruppe (neueste Session), Gesamtverbrauch =
+    # Summe der Zyklus-Verbraeuche, Mediane plausibel
+    assert len(data["sessions"]) == 1
+    s = data["sessions"][0]
+    assert s["session_id"] == created[-1]["id"]
+    assert s["n_cycles"] == 2
+    assert s["n_cycles_complete"] == 2
+    total = round(sum(c["charge_uah"] for c in data["cycles"]), 4)
+    assert s["charge_uah_total"] == total
+    assert s["charge_uah_median"] is not None and s["charge_uah_median"] > 0
+    assert s["duration_median_s"] is not None and s["duration_median_s"] > 0
+
+
+def test_power_sessions_unit_assignment(client):
+    """Unit: Zuordnungsregel 'spaeteste start_time <= Zyklusstart'."""
+    import power_cycles
+    sessions = [
+        {"id": 10, "start_time": "2026-10-12T12:00:00"},
+        {"id": 11, "start_time": "2026-10-12T13:00:00"},
+    ]
+    cycles = [
+        {"start": "2026-10-12T11:00:00"},   # vor aller ersten -> None
+        {"start": "2026-10-12T12:30:00"},   # in Session 10
+        {"start": "2026-10-12T13:30:00"},   # in Session 11
+        {"start": "2026-10-12T12:59:59"},   # knapp vor Session 11 -> 10
+    ]
+    out = power_cycles.assign_sessions_to_cycles(cycles, sessions)
+    assert [c["session_id"] for c in out] == [None, 10, 11, 10]
+
+
+def test_power_sessions_empty(client):
+    data = client.get("/power/sessions/unbekannt").json()
+    assert data["cycles"] == []
+    assert data["sessions"] == []
+    assert data["stats"] == {}
+
+
+def test_power_sessions_threshold_override(client):
+    """Alle Schwellwert-Parameter werden an die Analyse durchgereicht."""
+    _post_samples(client, "8", _profile_chain(1))
+    # trigger_ma ueber Peak -> kein Zyklus mehr erkannt
+    data = client.get("/power/sessions/8", params={
+        "trigger_ma": 1000.0, "quiet_ma": 1.0, "min_quiet_s": 0.5,
+        "max_cycle_s": 30.0, "gap_s": 2.0,
+    }).json()
+    assert data["cycles"] == []
+    assert data["sessions"] == []
+
+
+def test_power_sessions_cycle_has_session_id(client):
+    """Auch ohne Sessions in der DB: Feld session_id muss existieren (None)."""
+    _post_samples(client, "9", _profile_chain(1))
+    data = client.get("/power/sessions/9").json()
+    assert len(data["cycles"]) == 1
+    assert data["cycles"][0]["session_id"] is None
+    assert data["sessions"][0]["session_id"] is None
+    assert data["sessions"][0]["n_cycles"] == 1

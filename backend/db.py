@@ -1157,3 +1157,29 @@ def get_power_logger_ids() -> list[str]:
     rows = cursor.fetchall()
     conn.close()
     return [r[0] for r in rows]
+
+
+def get_sessions_chronological() -> list[dict]:
+    """
+    Alle Temperatursessions mit Startzeit (chronologisch, ohne Kalibrierdaten).
+
+    Grundlage fuer die serverseitige Zuordnung von Stromproben zu Sessions:
+    Eine Stromprobe gehoert zur Session mit der spaetesten start_time <=
+    Messzeitpunkt. Bewusst OHNE sensor_id-Filter: Es wird nur EIN Logger
+    gleichzeitig gemessen, und die Session startet beim Anlegen der neuen
+    Firmware-Version (siehe clone_latest_session_with_calibration).
+
+    @return [{id, sensor_id, start_time, custom_text}] (chronologisch)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, sensor_id, start_time, custom_text FROM sessions "
+        "ORDER BY start_time ASC, id ASC"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "sensor_id": r[1], "start_time": r[2], "custom_text": r[3]}
+        for r in rows
+    ]

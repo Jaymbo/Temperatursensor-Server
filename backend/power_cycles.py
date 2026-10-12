@@ -349,6 +349,95 @@ def analyze_cycles(
     return {"cycles": cycles, "stats": stats}
 
 
+def assign_sessions_to_cycles(
+    cycles: list[dict],
+    sessions: list[dict],
+) -> list[dict]:
+    """
+    Ordnet jedem Zyklus die zum Startzeitpunkt aktive Temperatursession zu.
+
+    Regel (siehe db.get_sessions_chronological): Eine Probe/Zyklus gehoert zur
+    Session mit der spaetesten start_time <= Zyklusstart. Bei `None`-Sessions
+    bzw. Zyklen vor der ersten Session bleibt session_id None.
+
+    @return neue Liste mit zusaetzlichem Feld "session_id" (int | None)
+    """
+    parsed = []
+    for s in sessions:
+        st = _parse_iso(s.get("start_time"))
+        if st is not None:
+            parsed.append((st, s.get("id")))
+
+    out = []
+    for c in cycles:
+        session_id = None
+        if parsed:
+            t0 = _parse_iso(c.get("start"))
+            if t0 is not None:
+                # spaeteste Session, deren Start <= Zyklusstart
+                best = None
+                for st, sid in parsed:
+                    if st <= t0:
+                        best = sid
+                    else:
+                        break
+                session_id = best
+        out.append({**c, "session_id": session_id})
+    return out
+
+
+def summarize_by_session(cycles: list[dict]) -> list[dict]:
+    """
+    Fasst Zyklen pro Session zusammen (Firmware-Versionsvergleich).
+
+    Pro Session: Anzahl Zyklen, Gesamt-/Median-Verbrauch je Zyklus und
+    Median-Dauer. Nur vollstaendige Zyklen (nicht truncated) zaehlen fuer die
+    Mediane; der Gesamtverbrauch inkludiert abgeschnittene Zyklen anteilig.
+
+    @return [{session_id, n_cycles, cycles_complete, charge_uah_total,
+              charge_uah_median, duration_median_s, ...}] (chronologisch)
+    """
+    groups: dict = {}
+    for c in cycles:
+        groups.setdefault(c.get("session_id"), []).append(c)
+
+    out = []
+    for session_id in sorted(groups, key=lambda s: (s is None, s)):
+        cyc = groups[session_id]
+        complete = [c for c in cyc if not c.get("truncated")]
+        charges = [c["charge_uah"] for c in cyc if c.get("charge_uah") is not None]
+        durs = [c["duration_s"] for c in complete if c.get("duration_s") is not None]
+        peaks = [c["peak_ma"] for c in complete if c.get("peak_ma") is not None]
+        out.append({
+            "session_id": session_id,
+            "n_cycles": len(cyc),
+            "n_cycles_complete": len(complete),
+            "charge_uah_total": round(sum(charges), 4) if charges else 0.0,
+            "charge_uah_median": round(statistics.median(charges), 4) if charges else None,
+            "charge_uah_max": round(max(charges), 4) if charges else None,
+            "duration_median_s": round(statistics.median(durs), 3) if durs else None,
+            "peak_ma_median": round(statistics.median(peaks), 3) if peaks else None,
+        })
+    return out
+
+
+def analyze_cycles_by_session(
+    measurements: list[dict],
+    sessions: list[dict],
+    **kwargs,
+) -> dict:
+    """
+    Vollanalyse wie analyze_cycles, zusaetzlich mit Session-Zuordnung und
+    Session-Zusammenfassung (Firmware-Versionsvergleich).
+
+    @return analyze_cycles-Struktur + {"sessions": summarize_by_session(...)}
+            (cycles enthalten je "session_id": int | None)
+    """
+    analysis = analyze_cycles(measurements, **kwargs)
+    cycles = assign_sessions_to_cycles(analysis["cycles"], sessions)
+    return {**analysis, "cycles": cycles, "sessions": summarize_by_session(cycles)}
+
+
 def build_overlay(
     measurements: list[dict],
     limit: int = 20,

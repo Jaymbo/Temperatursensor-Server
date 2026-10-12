@@ -16,8 +16,9 @@ from db import (
     upsert_battery, get_batteries, replace_battery_sessions, get_battery_sessions,
     # Strommessung
     add_power_measurements, add_power_aggregate, get_power_aggregates,
-    get_power_measurements, get_power_logger_ids,
+    get_power_measurements, get_power_logger_ids, get_sessions_chronological,
 )
+import db
 import power_cycles
 from update import (
     pull_update, get_current_version, check_setup, check_for_update,
@@ -1158,6 +1159,42 @@ def power_cycles_endpoint(
     if gap_s is not None:
         kwargs["gap_s"] = gap_s
     return power_cycles.analyze_cycles(measurements, **kwargs)
+
+
+@app.get("/power/sessions/{logger_id}")
+def power_sessions_endpoint(
+    logger_id: str,
+    since: str | None = None,
+    limit: int | None = None,
+    trigger_ma: float | None = None,
+    quiet_ma: float | None = None,
+    min_quiet_s: float | None = None,
+    max_cycle_s: float | None = None,
+    gap_s: float | None = None,
+):
+    """
+    Firmware-Versionsvergleich: Zyklen mit Session-Zuordnung + Zusammenfassung.
+
+    Jeder Zyklus bekommt die Temperatursession zugewiesen, die zum Zyklusstart
+    aktiv war (spaeteste Session mit start_time <= Zyklusstart). Die
+    Zusammenfassung zeigt pro Session den Gesamt-/Median-Verbrauch pro Zyklus
+    (charge_uah) und die Median-Dauer - damit lassen sich zwei Firmware-
+    Versionen direkt vergleichen (siehe power_cycles.analyze_cycles_by_session).
+    """
+    measurements = get_power_measurements(logger_id, since=since, limit=limit)
+    sessions = db.get_sessions_chronological()
+    kwargs = {}
+    if trigger_ma is not None:
+        kwargs["trigger_ma"] = trigger_ma
+    if quiet_ma is not None:
+        kwargs["quiet_ma"] = quiet_ma
+    if min_quiet_s is not None:
+        kwargs["min_quiet_s"] = min_quiet_s
+    if max_cycle_s is not None:
+        kwargs["max_cycle_s"] = max_cycle_s
+    if gap_s is not None:
+        kwargs["gap_s"] = gap_s
+    return power_cycles.analyze_cycles_by_session(measurements, sessions, **kwargs)
 
 
 @app.get("/power/cycles/{logger_id}/overlay")

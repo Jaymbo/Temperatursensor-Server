@@ -39,6 +39,18 @@ export interface PowerPhaseStat {
   max_s: number;
 }
 
+/** Zusammenfassung einer Session im Firmware-Versionsvergleich. */
+export interface PowerSessionSummary {
+  session_id: number | null;
+  n_cycles: number;
+  n_cycles_complete: number;
+  charge_uah_total: number;
+  charge_uah_median: number | null;
+  charge_uah_max: number | null;
+  duration_median_s: number | null;
+  peak_ma_median: number | null;
+}
+
 /** Reihenfolge der Phasen fuer die Tabelle (wie im Backend definiert). */
 export const POWER_PHASE_ORDER = ["wake", "measure", "wlan", "send_tail"] as const;
 
@@ -46,6 +58,7 @@ export const usePowerData = () => {
   const [loggers, setLoggers] = useState<string[]>([]);
   const [cycles, setCycles] = useState<PowerCycle[]>([]);
   const [stats, setStats] = useState<Record<string, PowerPhaseStat>>({});
+  const [sessions, setSessions] = useState<PowerSessionSummary[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -69,18 +82,23 @@ export const usePowerData = () => {
     setIsLoading(true);
     setError(null);
     try {
-      // Overlay (Rohkurven je Zyklus) und Statistik (Phasen-Dauern) parallel.
-      const [overlayRes, cyclesRes] = await Promise.all([
+      // Overlay (Rohkurven je Zyklus) und Statistik (Phasen-Dauern + Sessions)
+      // parallel. Die Session-Zusammenfassung kommt aus /power/sessions
+      // (Firmware-Versionsvergleich: Verbrauch pro Zyklus je Session).
+      const [overlayRes, cyclesRes, sessionsRes] = await Promise.all([
         fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}`)),
         fetch(buildApiUrl(`/power/cycles/${loggerId}`)),
+        fetch(buildApiUrl(`/power/sessions/${loggerId}`)),
       ]);
-      if (!overlayRes.ok || !cyclesRes.ok) {
+      if (!overlayRes.ok || !cyclesRes.ok || !sessionsRes.ok) {
         throw new Error("Fehler beim Laden der Zyklusanalyse.");
       }
       const overlay = await overlayRes.json();
       const cyclesData = await cyclesRes.json();
+      const sessionsData = await sessionsRes.json();
       setCycles(overlay.cycles || []);
       setStats(cyclesData.stats || {});
+      setSessions(sessionsData.sessions || []);
     } catch (err) {
       console.error(err);
       setError("Fehler beim Laden der Zyklusanalyse.");
@@ -89,5 +107,5 @@ export const usePowerData = () => {
     }
   }, []);
 
-  return { loggers, cycles, stats, isLoading, error, loadLoggers, loadCycles };
+  return { loggers, cycles, stats, sessions, isLoading, error, loadLoggers, loadCycles };
 };
