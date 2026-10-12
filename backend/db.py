@@ -6,13 +6,23 @@ import os
 # Use a DB file located next to this module to avoid cwd-dependent paths
 DB_PATH = os.path.join(os.path.dirname(__file__), "database.db")
 
+# SQLite-Zugriff: timeout verhindert "database is locked" bei konkurrierenden
+# Schreibern (Strommesser-Firmware streamt regelmaessig /power/*-Endpoints).
+# WAL-Modus wird in initialize_db() gesetzt (persistent je DB-Datei): Leser
+# blockieren den Schreiber dann nicht mehr und umgekehrt.
+DB_TIMEOUT_S = 30.0
+
+
 def initialize_db():
     """
     Initialisiert die Datenbank und erstellt die notwendigen Tabellen,
     falls sie nicht existieren.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
+    # WAL: Leser + Schreiber parallel moeglich (statt Datenbank-Lock bei jedem
+    # INSERT aus den Power-Streams). Persistent je DB-Datei, daher einmalig ok.
+    cursor.execute("PRAGMA journal_mode=WAL")
 
     # Tabelle 'sessions' erstellen sensor_id muss ohne not null sein
     cursor.execute(
@@ -269,7 +279,7 @@ def get_all_series():
     Gibt alle Sensor-Session-Kombinationen zurück.
     (Beispiel: [{'sensor_session': 'sensor_A_session1', 'custom_text': 'example text'}, ...])
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     # Jetzt genau aus der Tabelle sessions abfragen
     cursor.execute("SELECT sensor_id, id, custom_text FROM sessions ORDER BY sensor_id, id")
@@ -286,7 +296,7 @@ def get_data_by_sensor(sensor_session: str):
     Gibt alle Zeitpunkte und Temperaturen für einen bestimmten Sensor in einer bestimmten Session zurück.
     Dabei wird das start_time aus der Session mit dem time_offset aus measurements verrechnet.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     # sensor_session wird im Format sensorID_sessionID erwartet
@@ -321,7 +331,7 @@ def get_comments_by_sensor(sensor_session: str):
     """
     Gibt alle Kommentare für eine bestimmte Sensor-Session zurück.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -340,7 +350,7 @@ def add_comment(sensor_session: str, timestamp: str, temperature: float, comment
     """
     Fügt einen neuen Kommentar in die Datenbank ein.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -356,7 +366,7 @@ def delete_comment(sensor_session: str, timestamp: str, temperature: float, comm
     """
     Löscht einen Kommentar aus der Datenbank basierend auf sensor_session, timestamp, temperature und comment.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     # SQL-Befehl zum Löschen des Kommentars
@@ -373,7 +383,7 @@ def get_calibration_points(sensor_id: str):
     """
     Gibt Basis-Kalibrierungsparameter und Korrekturpunkte für eine Sensor_id zurück.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     session_id = get_latest_session_for_sensor_id(sensor_id)
@@ -408,7 +418,7 @@ def add_calibration(
     """
     session_id = get_latest_session_for_sensor_id(sensor_id)
     sensor_session = f"{sensor_id}_{session_id}"
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     try:
@@ -430,7 +440,7 @@ def get_latest_session_for_sensor_id(sensor_id: str):
     """
     Gibt die neueste sensor_session-ID für eine gegebene sensor_id zurück.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -458,7 +468,7 @@ def add_temperature_data(sensor_id: str, timestamps: list[str], temperatures: li
 
     session_id = get_latest_session_for_sensor_id(sensor_id)
     print(f"Füge Daten für Sensor-ID {sensor_id} in Session {session_id} ein.")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     # Füge die neuen Temperaturdaten in die measurements-Tabelle ein
@@ -478,7 +488,7 @@ def get_start_time_of_latest_session(sensor_id: str):
     """
     Gibt den Startzeitpunkt der neuesten sensor_session für eine gegebene sensor_id zurück.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -537,7 +547,7 @@ def clone_latest_session_with_calibration(sensor_id: str, messintervall: float =
     """
     DEFAULT_CALIBRATION = "100,3.9083e-3,-5.775e-7,3.0,10000"
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     try:
         # 1) Leeren Eintrag (ohne sensor_id) suchen
@@ -614,7 +624,7 @@ def get_time_factor(sensor_id: str) -> float:
     K < 1 staucht die Zeit (Uhr lief zu schnell). Fehlt noch keine Kalibrierung,
     wird 1.0 zurueckgegeben.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute("SELECT factor FROM time_calibration WHERE sensor_id = ?", (sensor_id,))
     row = cursor.fetchone()
@@ -632,7 +642,7 @@ def set_time_factor(sensor_id: str, factor: float) -> None:
         raise ValueError("sensor_id darf nicht leer sein.")
     if not (isinstance(factor, (int, float)) and factor > 0.0 and math.isfinite(float(factor))):
         raise ValueError("factor muss eine positive, endliche Zahl sein.")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT OR REPLACE INTO time_calibration (sensor_id, factor) VALUES (?, ?)",
@@ -654,7 +664,7 @@ def get_session_start_time(sensor_session: str) -> str | None:
         sensor_id, session_id = sensor_session.split("_")
     except ValueError:
         return None
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT start_time FROM sessions WHERE id = ? AND sensor_id = ?",
@@ -703,7 +713,7 @@ def add_or_update_custom_text_entry(custom_text: str, messintervall: float = 10.
     :param sendpuffer: Anzahl der Messpunkte vor dem Senden (Default: 10)
     :return: Die ID des Eintrags.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
 
     # Suche nach dem neuesten Eintrag, bei dem nur id und custom_text gefüllt sind
@@ -748,7 +758,7 @@ def get_session_hw_rev(sensor_id: str):
 
     None bedeutet "Altbestand" und darf NICHT als Konflikt gewertet werden.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT hw_rev FROM sessions WHERE sensor_id = ? "
@@ -771,7 +781,7 @@ def set_session_hw_rev(sensor_id: str, hw_rev: int) -> None:
     (eine laufende Session hat genau eine Revision).
     """
     session_id = get_latest_session_for_sensor_id(sensor_id)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE sessions SET hw_rev = ? WHERE id = ?",
@@ -788,7 +798,7 @@ def get_battery_assignment(sensor_id: str, at_time: str | None = None):
 
     :param at_time: ISO-Zeit; None = aktuell (to_time IS NULL).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     if at_time is None:
         cursor.execute(
@@ -825,7 +835,7 @@ def add_battery_assignment(
     Ein Wechsel wird als Ereignis protokolliert: die offene Zuordnung bekommt
     ein to_time, die neue startet. Wird ueber POST /battery/assign ausgeloest.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO battery_assignments (battery_id, sensor_id, from_time, to_time, reason) "
@@ -838,7 +848,7 @@ def add_battery_assignment(
 
 def close_open_battery_assignment(sensor_id: str, to_time: str) -> None:
     """Schliesst die offene Zuordnung eines Sensors (Wechsel/Reparatur)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE battery_assignments SET to_time = ? "
@@ -872,7 +882,7 @@ def add_battery_readings(rows: list[dict]) -> int:
         ))
     if not data:
         return 0
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.executemany(
         "INSERT OR IGNORE INTO battery_readings "
@@ -894,7 +904,7 @@ def get_battery_readings(sensor_id: str, limit: int | None = None,
     :param limit: maximale Anzahl (None = alle)
     :param since: nur Messwerte ab diesem ISO-Zeitpunkt
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     sql = ("SELECT measured_at, received_at, mv, raw, under_load, seq, hw_rev, battery_id "
            "FROM battery_readings WHERE sensor_id = ?")
@@ -927,7 +937,7 @@ def get_latest_battery_reading(sensor_id: str):
 
 def get_battery_sensor_ids() -> list[str]:
     """Alle Sensor-IDs, fuer die Akku-Messwerte vorliegen."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT sensor_id FROM battery_readings ORDER BY sensor_id")
     rows = cursor.fetchall()
@@ -941,7 +951,7 @@ def get_all_battery_readings(since: str | None = None, limit_per_sensor: int | N
 
     :param limit_per_sensor: nur die letzten N Werte je Sensor
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT sensor_id FROM battery_readings")
     sensor_ids = [r[0] for r in cursor.fetchall()]
@@ -961,7 +971,7 @@ def upsert_battery(battery_id: str, capacity_class: str | None = None,
                    purchase_date: str | None = None, status: str = "in_use",
                    notes: str | None = None) -> None:
     """Legt einen Akku an bzw. aktualisiert seine Stammdaten."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO batteries (battery_id, capacity_class, purchase_date, status, notes) "
@@ -977,7 +987,7 @@ def upsert_battery(battery_id: str, capacity_class: str | None = None,
 
 def get_batteries() -> list[dict]:
     """Alle Akkus (Stammdaten) zurueckgeben."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT battery_id, capacity_class, purchase_date, status, notes FROM batteries "
@@ -1001,7 +1011,7 @@ def replace_battery_sessions(sensor_id: str, sessions: list[dict]) -> None:
     Die Erkennung liegt in battery_health.py; hier wird nur gespeichert. Ein
     erneuter Lauf erzeugt die Phasen neu (Rohdaten bleiben unberuehrt).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM battery_sessions WHERE sensor_id = ?", (sensor_id,))
     cursor.executemany(
@@ -1019,7 +1029,7 @@ def replace_battery_sessions(sensor_id: str, sessions: list[dict]) -> None:
 
 def get_battery_sessions(sensor_id: str) -> list[dict]:
     """Abgeleitete Betriebsphasen eines Sensors (chronologisch)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT sensor_id, battery_id, start_time, end_time, type, note "
@@ -1058,7 +1068,7 @@ def add_power_measurements(rows: list[dict]) -> int:
         )
         for r in rows
     ]
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.executemany(
         "INSERT OR IGNORE INTO power_measurements "
@@ -1077,7 +1087,7 @@ def add_power_aggregate(row: dict) -> None:
     Speichert ein Aggregat (Live-Anzeige). charge_uah wird durch Integration
     der Rohproben berechnet (nicht durch Mittelwertbildung, siehe Schema).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO power_aggregates "
@@ -1097,7 +1107,7 @@ def add_power_aggregate(row: dict) -> None:
 
 def get_power_aggregates(logger_id: str, since: str | None = None) -> list[dict]:
     """Aggregate eines Loggers (chronologisch), optional ab since."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     sql = ("SELECT window_start, window_end, samples, current_ma_mean, current_ma_min, "
            "current_ma_max, charge_uah, gap FROM power_aggregates WHERE logger_id = ?")
@@ -1122,7 +1132,7 @@ def get_power_aggregates(logger_id: str, since: str | None = None) -> list[dict]
 def get_power_measurements(logger_id: str, since: str | None = None,
                            limit: int | None = None) -> list[dict]:
     """Rohproben eines Loggers (chronologisch)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     sql = ("SELECT measured_at, current_ma, bus_v, shunt_mv, range_ma, seq "
            "FROM power_measurements WHERE logger_id = ?")
@@ -1148,7 +1158,7 @@ def get_power_measurements(logger_id: str, since: str | None = None,
 
 def get_power_logger_ids() -> list[str]:
     """Logger-IDs, fuer die Stromproben vorliegen (neueste zuerst)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT logger_id, MAX(measured_at) FROM power_measurements "
@@ -1171,7 +1181,7 @@ def get_sessions_chronological() -> list[dict]:
 
     @return [{id, sensor_id, start_time, custom_text}] (chronologisch)
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT id, sensor_id, start_time, custom_text FROM sessions "
