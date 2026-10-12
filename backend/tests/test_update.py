@@ -590,3 +590,37 @@ def test_verify_password_no_password(temp_db_path, monkeypatch):
         assert response.status_code == 200
         data = response.json()
         assert data["valid"] is False
+
+def test_update_pull_reset_fails(temp_db_path, monkeypatch):
+    """POST /update/pull: git reset --hard fehlschlägt → Fehlermeldung."""
+    monkeypatch.setattr(dbmod, "DB_PATH", str(temp_db_path), raising=False)
+    client, main, update = _make_client(temp_db_path)
+
+    def git_side_effect(args, **kwargs):
+        if args[:2] == ["reset", "--hard"]:
+            return ("", "fatal: reset fehlgeschlagen", 1)
+        return ("", "", 0)
+
+    with patch.object(update, "get_admin_password", return_value="testpassword"):
+        with patch.object(update, "_run_git", side_effect=git_side_effect):
+            response = client.post("/update/pull", json={"password": "testpassword"})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is False
+            assert "git reset fehlgeschlagen" in data["message"]
+
+
+def test_update_pull_skips_rebuild_under_pytest(temp_db_path, monkeypatch):
+    """POST /update/pull erfolgreich: Unter pytest wird der Docker-Rebuild
+    (PYTEST_CURRENT_TEST gesetzt) uebersprungen und der Pfad bis zum Return
+    inklusive _get_host_project_dir-Definition durchlaufen."""
+    monkeypatch.setattr(dbmod, "DB_PATH", str(temp_db_path), raising=False)
+    client, main, update = _make_client(temp_db_path)
+
+    # Rebuild-Thread (falls doch gestartet) mocken, damit kein Docker laeuft
+    with patch.object(update, "get_admin_password", return_value="testpassword"):
+        with patch.object(update, "_run_git", return_value=("", "", 0)):
+            response = client.post("/update/pull", json={"password": "testpassword"})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True

@@ -293,3 +293,188 @@ def test_multiple_sessions_each_use_own_start(client):
     b = apply_time_calibration_to_session("20_301", [{"timestamp": "2026-03-01T02:00:00", "temperature": 20.0}])
     assert a[0]["timestamp"] == "2026-01-01T04:00:00"  # 2h*2 relativ zu Jan-Start
     assert b[0]["timestamp"] == "2026-03-01T04:00:00"  # 2h*2 relativ zu Mar-Start
+
+
+# ── Fehler-/Defensivpfade (fuer 100 % Coverage) ──────────────────────────
+
+def test_extract_sensor_id_without_underscore():
+    from main import _extract_sensor_id
+    assert _extract_sensor_id("plain") == "plain"
+
+
+def test_apply_time_calibration_empty_data():
+    from main import apply_time_calibration_to_session
+    assert apply_time_calibration_to_session("x_1", []) == []
+
+
+def test_apply_time_calibration_skips_non_dict(client):
+    from main import apply_time_calibration_to_session
+    _seed("30", "2026-01-01T00:00:00", 300, [])
+    dbmod.set_time_factor("30", 2.0)
+    data = [
+        "kein-dict",
+        {"timestamp": "2026-01-01T02:00:00", "temperature": 21.0},
+        {"temperature": 5.0},   # ohne timestamp -> unveraendert
+    ]
+    out = apply_time_calibration_to_session("30_300", data)
+    assert out[0] == "kein-dict"
+    assert out[1]["timestamp"] == "2026-01-01T04:00:00"
+    assert out[2] == {"temperature": 5.0}
+
+
+def test_apply_time_calibration_no_start_returns_data(client):
+    from main import apply_time_calibration_to_session
+    # Faktor != 1, aber Session existiert nicht -> start_time None -> unveraendert
+    dbmod.set_time_factor("31", 2.0)
+    data = [{"timestamp": "2026-01-01T02:00:00", "temperature": 21.0}]
+    assert apply_time_calibration_to_session("31_999", data) == data
+
+
+def test_generate_time_calibration_preview_paths(client, monkeypatch):
+    import main
+    _seed("40", "2026-01-01T00:00:00", 400, [("2026-01-01T02:00:00", 21.0)])
+    out = main.generate_time_calibration_preview("40_400", 2.0)
+    assert out["timestamps"] == ["2026-01-01T04:00:00"]
+    assert out["temperatures"] == [21.0]
+    # keine Daten -> None
+    assert main.generate_time_calibration_preview("41_401", 2.0) is None
+    # ungueltige Punkte werden uebersprungen; nur der gueltige bleibt
+    _seed("42", "2026-01-01T00:00:00", 402, [])
+    monkeypatch.setattr(main, "get_data_by_sensor", lambda s: [
+        "kein-dict",
+        {"timestamp": None, "temperature": 20.0},
+        {"timestamp": "2026-01-01T02:00:00", "temperature": None},
+        {"timestamp": "2026-01-01T02:00:00", "temperature": 21.0},
+    ])
+    out = main.generate_time_calibration_preview("42_402", 2.0)
+    assert out["timestamps"] == ["2026-01-01T04:00:00"]
+    # ALLE Punkte ungueltig -> None
+    monkeypatch.setattr(main, "get_data_by_sensor", lambda s: [
+        "kein-dict", {"timestamp": None, "temperature": 1.0}])
+    assert main.generate_time_calibration_preview("42_402", 2.0) is None
+
+
+def test_compute_new_factor_invalid_iso_raises():
+    import pytest
+    from main import compute_new_time_factor
+    with pytest.raises(ValueError):
+        compute_new_time_factor(
+            1.0, "kaputt", "2026-01-01T04:00:00", "2026-01-01T00:00:00")
+
+
+def test_measurements_broadcast_applies_time_factor(client, monkeypatch):
+    """/measurements mit gesetztem Faktor: Broadcast enthaelt korrigierte Timestamps."""
+    import main
+    _seed("50", "2026-01-01T00:00:00", 500, [])
+    dbmod.set_time_factor("50", 2.0)
+    captured = []
+
+    async def fake_broadcast(session, payload):
+        captured.append((session, payload))
+
+    monkeypatch.setattr(main.manager, "broadcast", fake_broadcast)
+    res = client.post("/measurements", json={
+        "sensor_id": "50", "timestamps": [0, 3600], "temperatures": [20.0, 21.0]})
+    assert res.json()["status"] == "success"
+    assert captured and captured[0][1]["action"] == "new_measurements"
+    ts = captured[0][1]["timestamps"]
+    assert ts[0].startswith("2026-01-01T00:00:00")  # Start fix
+    assert ts[1].startswith("2026-01-01T02:00:00")  # 1h * 2 = 2h
+
+
+def test_calibrate_time_missing_fields(client):
+    res = client.post("/calibrate_time", json={})
+    assert res.json()["status"] == "error"
+
+
+def test_calibrate_time_no_session(client):
+    res = client.post("/calibrate_time", json={
+        "sensor_session": "60_6000",
+        "measured_timestamp": "2026-01-01T02:00:00",
+        "actual_timestamp": "2026-01-01T04:00:00"})
+    assert res.json()["message"] == "Keine Session/Startzeit gefunden."
+
+
+def test_calibrate_time_negative_factor(client):
+    # actual VOR dem Session-Start -> negativer Faktor -> abgelehnt
+    sensor_session = _seed("61", "2026-01-01T00:00:00", 601, [])
+    res = client.post("/calibrate_time", json={
+        "sensor_session": sensor_session,
+        "measured_timestamp": "2026-01-01T02:00:00",
+        "actual_timestamp": "2025-01-01T00:00:00"})
+    assert res.json()["message"] == "Ungueltiger Zeitfaktor berechnet."
+
+
+def test_calibrate_time_unexpected_error(client, monkeypatch):
+    import main
+    sensor_session = _seed("62", "2026-01-01T00:00:00", 602, [])
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main, "compute_new_time_factor", boom)
+    res = client.post("/calibrate_time", json={
+        "sensor_session": sensor_session,
+        "measured_timestamp": "2026-01-01T02:00:00",
+        "actual_timestamp": "2026-01-01T04:00:00"})
+    assert res.json()["status"] == "error"
+    assert "Zeit-Kalibrierungsfehler" in res.json()["message"]
+
+
+def test_calibrate_time_apply_no_session(client):
+    res = client.post("/calibrate_time/apply", json={
+        "sensor_session": "63_6003",
+        "measured_timestamp": "2026-01-01T02:00:00",
+        "actual_timestamp": "2026-01-01T04:00:00"})
+    assert res.json()["message"] == "Keine Session/Startzeit gefunden."
+
+
+def test_calibrate_time_apply_negative_factor(client):
+    sensor_session = _seed("64", "2026-01-01T00:00:00", 604, [])
+    res = client.post("/calibrate_time/apply", json={
+        "sensor_session": sensor_session,
+        "measured_timestamp": "2026-01-01T02:00:00",
+        "actual_timestamp": "2025-01-01T00:00:00"})
+    assert res.json()["message"] == "Ungueltiger Zeitfaktor berechnet."
+
+
+def test_calibrate_time_apply_unexpected_error(client, monkeypatch):
+    import main
+    sensor_session = _seed("65", "2026-01-01T00:00:00", 605, [])
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(main, "compute_new_time_factor", boom)
+    res = client.post("/calibrate_time/apply", json={
+        "sensor_session": sensor_session,
+        "measured_timestamp": "2026-01-01T02:00:00",
+        "actual_timestamp": "2026-01-01T04:00:00"})
+    assert res.json()["status"] == "error"
+    assert "Zeit-Kalibrierungsfehler" in res.json()["message"]
+
+
+def test_main_parse_iso_defensive():
+    from main import _parse_iso
+    assert _parse_iso("") is None
+    assert _parse_iso(None) is None
+    assert _parse_iso("kaputt") is None
+
+
+def test_reading_age_invalid_dates():
+    from main import _reading_age_seconds
+    assert _reading_age_seconds(None) is None
+    assert _reading_age_seconds({"measured_at": None, "received_at": None}) is None
+    # Datum vorhanden, aber unparsebar -> None
+    assert _reading_age_seconds({"measured_at": None, "received_at": "kaputt"}) is None
+
+
+def test_get_session_start_time_malformed_session():
+    # sensor_session ohne '_' -> ValueError im split -> None
+    assert dbmod.get_session_start_time("keinunderscore") is None
+
+
+def test_apply_time_factor_invalid_timestamp():
+    start = "2026-01-01T00:00:00"
+    # Ungueltiger Timestamp -> Original zurueck (defensiv)
+    assert dbmod.apply_time_factor("kaputt", start, 2.0) == "kaputt"

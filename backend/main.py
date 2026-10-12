@@ -490,7 +490,7 @@ async def add_measurements_endpoint(payload: dict):
         factor = get_time_factor(sensor_id)
         if factor != 1.0:
             broadcast_timestamps = [
-                apply_time_factor(ts, start_time, factor) for ts in absolute_timestamps
+                apply_time_factor(ts, start_time.isoformat(), factor) for ts in absolute_timestamps
             ]
         else:
             broadcast_timestamps = absolute_timestamps

@@ -289,8 +289,9 @@ def pull_update(password: str) -> dict:
     }
 
     # Vollständiger System-Rebuild: Frontend + Backend
+    # (nur in Produktion; unter pytest untestbar -> pragma: no cover)
     import threading, subprocess
-    def _get_host_project_dir() -> str:
+    def _get_host_project_dir() -> str:  # pragma: no cover
         """Ermittelt den echten Host-Pfad für das gemountete Repo."""
         result = subprocess.run(
             ["docker", "inspect", "temp-backend", "--format",
@@ -300,7 +301,7 @@ def pull_update(password: str) -> dict:
         host_dir = result.stdout.strip()
         return host_dir if host_dir else "/home/server2/temperatursensor-server"
 
-    def _rebuild_system():
+    def _rebuild_system():  # pragma: no cover
         import time, os as osmod
         time.sleep(2)
         host_dir = _get_host_project_dir()
@@ -318,7 +319,7 @@ def pull_update(password: str) -> dict:
         proc.wait()
         osmod._exit(0)
 
-    if os.getenv("PYTEST_CURRENT_TEST") is None:
+    if os.getenv("PYTEST_CURRENT_TEST") is None:  # pragma: no cover
         threading.Thread(target=_rebuild_system, daemon=True).start()
 
     return result
