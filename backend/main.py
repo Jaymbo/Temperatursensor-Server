@@ -505,7 +505,15 @@ async def add_measurements_endpoint(payload: dict):
             "temperatures": absolute_temperatures
         })
 
-        return {"status": "success", "sensor_session": sensor_session}
+        # Geräteseitige Zeitsynchronisation: Die Firmware setzt ihre lokale
+        # Zeitbasis nach jedem erfolgreichen Senden auf diese verstrichene
+        # Zeit seit Session-Start (verhindert Drift durch Deep-Sleep).
+        elapsed_s = (datetime.datetime.now() - start_time).total_seconds()
+        return {
+            "status": "success",
+            "sensor_session": sensor_session,
+            "elapsed_s": elapsed_s,
+        }
     except ValueError as e:
         return {"status": "error in main.py", "message": str(e), "absolute_timestamps": absolute_timestamps, "absolute_temperatures": absolute_temperatures}
     except Exception as e:
