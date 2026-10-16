@@ -477,6 +477,39 @@ async def add_measurements_endpoint(payload: dict):
         # Daten in die Datenbank einfügen
         sensor_session = add_temperature_data(sensor_id, absolute_timestamps, absolute_temperatures)
 
+        # Diagnose-Log: Geraeteseitige Zaehler mit der echten Empfangszeit
+        # speichern. Damit ist Schlaf-/Wach-/Sendeverhalten ohne Serial
+        # nachvollziehbar (Display belegt die UART-Pins).
+        try:
+            import sqlite3
+            diag_conn = sqlite3.connect(db.DB_PATH, timeout=db.DB_TIMEOUT_S)
+            diag_conn.execute("""
+                CREATE TABLE IF NOT EXISTS device_diagnostics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sensor_id TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    boot_count INTEGER,
+                    rtc_entries INTEGER,
+                    uptime_s REAL,
+                    send_every INTEGER
+                )
+            """)
+            diag_conn.execute(
+                "INSERT INTO device_diagnostics (sensor_id, received_at, boot_count, rtc_entries, uptime_s, send_every) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(sensor_id),
+                    datetime.datetime.now().isoformat(),
+                    payload.get("diag_boot"),
+                    payload.get("diag_rtc_entries"),
+                    payload.get("diag_uptime_s"),
+                    payload.get("diag_send_every"),
+                ),
+            )
+            diag_conn.commit()
+            diag_conn.close()
+        except Exception as e:
+            print(f"Diagnose-Log fehlgeschlagen: {e}")
+
         # Hardware-Revision der laufenden Session merken (erster Wert gewinnt).
         hw_rev = payload.get("hw_rev")
         if hw_rev is not None:
