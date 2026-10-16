@@ -491,11 +491,13 @@ async def add_measurements_endpoint(payload: dict):
                     boot_count INTEGER,
                     rtc_entries INTEGER,
                     uptime_s REAL,
-                    send_every INTEGER
+                    send_every INTEGER,
+                    messintervall_s REAL,
+                    sleep_s REAL
                 )
             """)
             diag_conn.execute(
-                "INSERT INTO device_diagnostics (sensor_id, received_at, boot_count, rtc_entries, uptime_s, send_every) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO device_diagnostics (sensor_id, received_at, boot_count, rtc_entries, uptime_s, send_every, messintervall_s, sleep_s) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(sensor_id),
                     datetime.datetime.now().isoformat(),
@@ -503,6 +505,8 @@ async def add_measurements_endpoint(payload: dict):
                     payload.get("diag_rtc_entries"),
                     payload.get("diag_uptime_s"),
                     payload.get("diag_send_every"),
+                    payload.get("diag_messintervall_s"),
+                    payload.get("diag_sleep_s"),
                 ),
             )
             diag_conn.commit()
