@@ -8,14 +8,28 @@ import { FleetComparison } from "./components/FleetComparison";
 import { useSensorData } from "./hooks/useSensorData";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { useBatteryData, type BatteryHistory } from "./hooks/useBatteryData";
-import { usePowerData } from "./hooks/usePowerData";
-import { PowerOverlayChart } from "./components/PowerOverlayChart";
-import { PowerPhaseTable } from "./components/PowerPhaseTable";
-import { PowerSessionTable } from "./components/PowerSessionTable";
+import { usePowerData, type PowerChargeResult } from "./hooks/usePowerData";
+import { PowerStreamChart, type PowerViewWindow } from "./components/PowerStreamChart";
 import { buildApiUrl, getApiBase } from "./api";
 import { parseCorrectionPoints, type CorrectionPoint, localIso, buildActualTimestamp } from "./utils";
 
 const API_BASE = getApiBase();
+
+// Strom-Panel: Live-Fenster (neueste 60 s) + Bucket-Raster-Logik.
+const POWER_LIVE_WINDOW_MS = 60000;
+// Ziel-Punktzahl im Chart - daraus wird die Bucket-Dauer abgeleitet (eng
+// gezoomt = feinere Buckets bis zum 5-ms-Rohraster, weit gezoomt = groeber).
+const POWER_TARGET_BUCKETS = 600;
+
+/** Bucket-Dauer in Sekunden fuer ein Fenster (auf "schone" Werte gerundet). */
+function powerBucketSeconds(fromMs: number, toMs: number): number {
+  const raw = (toMs - fromMs) / 1000 / POWER_TARGET_BUCKETS;
+  const steps = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60];
+  for (const s of steps) {
+    if (raw <= s) return s;
+  }
+  return 60;
+}
 
 // npm run dev
 function App() {
@@ -55,14 +69,19 @@ function App() {
   const [batteryHistory, setBatteryHistory] = useState<BatteryHistory | null>(null);
   const [showPower, setShowPower] = useState<boolean>(false);
   const [powerLogger, setPowerLogger] = useState<string | null>(null);
-  // Overlay-Modus: "avg" (Standard: Mittelwert +/- std pro Session) oder
-  // "cycles" (Einzelzyklen uebereinander).
-  const [powerMode, setPowerMode] = useState<"avg" | "cycles">("avg");
-  // Mehrfachauswahl der Sessions (Firmware-Versionen); leer = alle anzeigen.
-  const [powerSessionFilter, setPowerSessionFilter] = useState<number[]>([]);
-  // Gezoomtes Overlay-Fenster (Sekunden seit Zyklusanfang) -> Nachladen in
-  // voller Aufloesung; null = Gesamtansicht (downgesampelt).
-  const [powerZoomWindow, setPowerZoomWindow] = useState<{ startS: number; endS: number } | null>(null);
+  // Live-Modus: Chart folgt den neuesten 60 s (Zoom resettet nach jedem
+  // Daten-Update). AUS = freies Zoomen/Panen ohne Auto-Ruecksetzung.
+  const [powerLive, setPowerLive] = useState<boolean>(true);
+  // Sichtbares Fenster (Epoch-ms): im Live-Modus vom Polling gesetzt, im
+  // Explore-Modus durch Zoom/Pan bzw. Session-Klick.
+  const [powerViewWindow, setPowerViewWindow] = useState<PowerViewWindow | null>(null);
+  // "Verbrauch messen": Auswahlmodus, pending Markierung + Auswertung.
+  const [powerMeasuring, setPowerMeasuring] = useState<boolean>(false);
+  const [powerPending, setPowerPending] = useState<PowerViewWindow | null>(null);
+  const [powerChargePreview, setPowerChargePreview] = useState<PowerChargeResult | null>(null);
+  const [measureLabel, setMeasureLabel] = useState<string>("");
+  // Gewaehlte Session im Strom-Panel (null = neueste Session, Live-Follow).
+  const [powerStreamSessionId, setPowerStreamSessionId] = useState<number | null>(null);
   const power = usePowerData();
   const {
     summary: batterySummary,
@@ -90,33 +109,101 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showPower]);
 
-  // Logger-Auswahl -> Zyklen + Statistik laden.
+  // Logger-Auswahl: Auswahlmodus zuruecksetzen + gespeicherte Bereiche laden.
   useEffect(() => {
     if (!powerLogger) return;
-    setPowerZoomWindow(null); // Logger-Wechsel: Zoom zuruecksetzen
-    power.loadCycles(powerLogger, 20, undefined, 500, powerMode,
-      powerSessionFilter);
+    setPowerMeasuring(false);
+    setPowerPending(null);
+    setPowerChargePreview(null);
+    setPowerLive(true); // Logger-Wechsel: zurueck in den Live-Modus
+    power.loadSelections(powerLogger);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [powerLogger]);
 
-  // Mode-/Session-Auswahl geaendert -> neu laden (Zoom zuruecksetzen).
+  // Live-Modus: beim Start das Fenster auf die neuesten 60 s setzen und
+  // alle 2 s nachladen (Zoom resettet mit -> Chart folgt den neuesten Daten).
   useEffect(() => {
-    if (!powerLogger) return;
-    setPowerZoomWindow(null);
-    power.loadCycles(powerLogger, 20, undefined, 500, powerMode,
-      powerSessionFilter);
+    if (!showPower || !powerLogger || !powerLive) return;
+    let cancelled = false;
+    const fetchWindow = (fromMs: number, toMs: number) => {
+      power.loadStream(powerLogger, new Date(fromMs).toISOString(),
+        new Date(toMs).toISOString(), powerBucketSeconds(fromMs, toMs));
+    };
+    const now = Date.now();
+    setPowerViewWindow({ fromMs: now - POWER_LIVE_WINDOW_MS, toMs: now + 5000 });
+    fetchWindow(now - POWER_LIVE_WINDOW_MS, now + 5000);
+    const timer = setInterval(() => {
+      if (cancelled) return;
+      const n = Date.now();
+      setPowerViewWindow({ fromMs: n - POWER_LIVE_WINDOW_MS, toMs: n + 5000 });
+      fetchWindow(n - POWER_LIVE_WINDOW_MS, n + 5000);
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [powerMode, powerSessionFilter]);
+  }, [showPower, powerLogger, powerLive]);
 
-  // Zoom-Fenster geaendert -> Overlay-Ausschnitt in voller Aufloesung nachladen.
-  // Nur das Overlay (loadOverlay), nicht die Statistik - die aendert sich beim
-  // Zoomen nicht und deren Vollanalyse wuerde das Nachladen verlangsamen.
+  // Explore-Modus: Fenster geaendert (Zoom/Pan/Session-Klick) -> nachladen.
+  // Kein Polling - neue Daten am rechten Rand interessieren beim Erkunden der
+  // Vergangenheit nicht; der Live-Modus ist der Weg zurueck zu "jetzt".
   useEffect(() => {
-    if (!powerLogger) return;
-    power.loadOverlay(powerLogger, powerZoomWindow ?? undefined,
-      powerZoomWindow ? 5000 : 500, 20, powerMode, powerSessionFilter);
+    if (powerLive || !powerLogger || !powerViewWindow) return;
+    power.loadStream(powerLogger, new Date(powerViewWindow.fromMs).toISOString(),
+      new Date(powerViewWindow.toMs).toISOString(),
+      powerBucketSeconds(powerViewWindow.fromMs, powerViewWindow.toMs));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [powerZoomWindow]);
+  }, [powerLive, powerLogger, powerViewWindow]);
+
+  // Session-Klick: definiertes Zoomfenster laden (Start - 20 s bis letzte
+  // Messung + 60 s) und in den Explore-Modus wechseln.
+  const handlePowerSessionZoom = async (sessionId: number) => {
+    if (!powerLogger) return;
+    const win = await power.loadWindow(powerLogger, sessionId);
+    if (!win) return;
+    setPowerLive(false);
+    setPowerStreamSessionId(sessionId);
+    setPowerViewWindow({
+      fromMs: Date.parse(win.start),
+      toMs: win.end ? Date.parse(win.end) : Date.now() + 5000,
+    });
+  };
+
+  // Drag-Auswahl fertig -> Auswertung (Preview) vom Server holen.
+  const handlePowerMeasure = async (range: PowerViewWindow) => {
+    if (!powerLogger) return;
+    setPowerMeasuring(false);
+    setPowerPending(range);
+    setPowerChargePreview(null);
+    try {
+      const res = await fetch(buildApiUrl(`/power/charge/${powerLogger}`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from_ts: new Date(range.fromMs).toISOString(),
+          to_ts: new Date(range.toMs).toISOString(),
+        }),
+      });
+      if (!res.ok) throw new Error(`Fehler bei der Auswertung: ${res.statusText}`);
+      setPowerChargePreview(await res.json());
+    } catch (err) {
+      console.error(err);
+      setPowerChargePreview(null);
+    }
+  };
+
+  // Markierten Bereich speichern (Auswertung macht das Backend).
+  const handlePowerSaveMeasure = async () => {
+    if (!powerLogger || !powerPending) return;
+    await power.saveSelection(powerLogger,
+      new Date(powerPending.fromMs).toISOString(),
+      new Date(powerPending.toMs).toISOString(),
+      measureLabel.trim() || null);
+    setPowerPending(null);
+    setPowerChargePreview(null);
+    setMeasureLabel("");
+  };
 
   // Verlauf des ausgewaehlten Sensors laden (fuer den Akku-Chart).
   useEffect(() => {
@@ -975,7 +1062,7 @@ function App() {
         </div>
       )}
 
-      {/* Strom-Panel: Zyklus-Overlay + Phasen-Dauern */}
+      {/* Strom-Panel: kontinuierlicher Stream + Verbrauchs-Bereiche */}
       {showPower && (
         <div
           role="dialog"
@@ -992,7 +1079,7 @@ function App() {
             style={{
               background: '#fff', color: '#222', padding: '24px 28px',
               borderRadius: 12, boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
-              width: '85vw', maxWidth: 1100, maxHeight: '85vh', overflow: 'auto'
+              width: '90vw', maxWidth: 1200, maxHeight: '90vh', overflow: 'auto'
             }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -1011,9 +1098,8 @@ function App() {
             </div>
 
             <p style={{ margin: '0 0 12px', fontSize: 13, color: '#777' }}>
-              Oszilloskop-Ansicht: Alle Messzyklen werden am Stromanstieg (Trigger)
-              auf t=0 überlagert. Die Phasen-Dauern unten zeigen z. B., ob der
-              WLAN-Connect mal kurz (0,8 s) und mal lang (2,3 s) dauert.
+              Kontinuierlicher Strom-Stream (200 Hz) mit Session-Hintergrund.
+              Bereiche markieren, um den Verbrauch zu messen und zu vergleichen.
             </p>
 
             {power.error && (
@@ -1021,7 +1107,7 @@ function App() {
             )}
 
             {/* Logger-Auswahl */}
-            <div style={{ display: 'flex', gap: '0.6vw', flexWrap: 'wrap', marginBottom: 16 }}>
+            <div style={{ display: 'flex', gap: '0.6vw', flexWrap: 'wrap', marginBottom: 12 }}>
               {power.loggers.map((id) => (
                 <button
                   key={id}
@@ -1044,88 +1130,184 @@ function App() {
             </div>
 
             {powerLogger ? (
-              power.isLoading ? (
-                <div style={{ color: '#888', fontSize: '1.8vh' }}>Lade Zyklen...</div>
-              ) : (
-                <>
-                  <h4 style={{ margin: '0 0 8px' }}>
-                    Zyklus-Overlay · Logger #{powerLogger}
-                  </h4>
-
-                  {/* Modus: Session-Durchschnitt (Standard) vs. Einzelzyklen */}
-                  <div style={{ display: 'flex', gap: 8, marginBottom: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <button
-                      onClick={() => setPowerMode('avg')}
-                      style={{
-                        padding: '4px 10px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
-                        border: powerMode === 'avg' ? '2px solid #e07b00' : '1px solid #ccc',
-                        background: powerMode === 'avg' ? '#ffe8d0' : '#fff',
+              <>
+                {/* Kopfzeile: Session-Auswahl + Live-Schalter + Verbrauch messen */}
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 }}>
+                  {/* Session-Auswahl (Standard: neueste Session) */}
+                  <label style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    Session:
+                    <select
+                      value={powerStreamSessionId ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v === '') {
+                          // Neueste Session: zurueck in den Live-Modus
+                          setPowerStreamSessionId(null);
+                          setPowerLive(true);
+                        } else {
+                          handlePowerSessionZoom(Number(v));
+                        }
                       }}
+                      style={{ fontSize: 13, padding: '4px 6px', borderRadius: 6, border: '1px solid #ccc', maxWidth: 320 }}
                     >
-                      Ø ± Streubereich (Standard)
-                    </button>
-                    <button
-                      onClick={() => setPowerMode('cycles')}
-                      style={{
-                        padding: '4px 10px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
-                        border: powerMode === 'cycles' ? '2px solid #e07b00' : '1px solid #ccc',
-                        background: powerMode === 'cycles' ? '#ffe8d0' : '#fff',
-                      }}
-                    >
-                      Einzelzyklen
-                    </button>
-                  </div>
-
-                  {/* Session-Mehrfachauswahl (avg-Modus: Filter, leer = alle) */}
-                  {powerMode === 'avg' && power.sessionOptions.length > 0 && (
-                    <div style={{ marginBottom: 12, maxHeight: '18vh', overflowY: 'auto', border: '1px solid #ddd', borderRadius: 8, padding: 8 }}>
-                      <div style={{ fontSize: 13, color: '#555', marginBottom: 6 }}>
-                        Sessions anzeigen ({powerSessionFilter.length === 0 ? 'alle' : `${powerSessionFilter.length} gewählt`}):
-                      </div>
+                      <option value="">Neueste Session</option>
                       {power.sessionOptions.map((s) => (
-                        <label key={s.id} style={{ display: 'block', fontSize: 13, padding: '2px 0', cursor: 'pointer' }}>
-                          <input
-                            type="checkbox"
-                            checked={powerSessionFilter.includes(s.id)}
-                            onChange={(e) => {
-                              setPowerSessionFilter((prev) =>
-                                e.target.checked ? [...prev, s.id] : prev.filter((x) => x !== s.id)
-                              );
-                            }}
-                            style={{ marginRight: 6 }}
-                          />
-                          {s.custom_text || `Session ${s.id}`}
-                          <span style={{ color: '#999', marginLeft: 6 }}>
-                            {s.start_time.slice(0, 16).replace('T', ' ')}
-                          </span>
-                        </label>
+                        <option key={s.id} value={s.id}>
+                          {s.custom_text || `Session ${s.id}`} ({s.start_time.slice(0, 16).replace('T', ' ')})
+                        </option>
                       ))}
-                      {powerSessionFilter.length > 0 && (
-                        <button
-                          onClick={() => setPowerSessionFilter([])}
-                          style={{ marginTop: 4, fontSize: 12, cursor: 'pointer', border: '1px solid #ccc', borderRadius: 6, padding: '2px 8px', background: '#fff' }}
-                        >
-                          Alle anzeigen
-                        </button>
-                      )}
-                    </div>
-                  )}
+                    </select>
+                  </label>
 
-                  <PowerOverlayChart
-                    cycles={power.cycles}
-                    avg={power.avg}
-                    onZoomWindow={setPowerZoomWindow}
-                    zoomWindow={powerZoomWindow}
-                  />
-                  <h4 style={{ margin: '16px 0 8px' }}>Phasen-Dauern (min / Median / max)</h4>
-                  <PowerPhaseTable stats={power.stats} />
-                  <h4 style={{ margin: '16px 0 8px' }}>Verbrauch pro Session (Firmware-Versionsvergleich)</h4>
-                  <PowerSessionTable sessions={power.sessions} />
-                </>
-              )
+                  {/* Live-Schalter */}
+                  <label style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={powerLive}
+                      onChange={(e) => setPowerLive(e.target.checked)}
+                    />
+                    Live
+                  </label>
+
+                  {/* Verbrauch messen */}
+                  <button
+                    onClick={() => {
+                      setPowerMeasuring((v) => !v);
+                      setPowerPending(null);
+                      setPowerChargePreview(null);
+                    }}
+                    style={{
+                      padding: '4px 12px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
+                      border: powerMeasuring ? '2px solid #e07b00' : '1px solid #ccc',
+                      background: powerMeasuring ? '#ffe8d0' : '#fff',
+                    }}
+                  >
+                    {powerMeasuring ? 'Auswahl abbrechen' : 'Verbrauch messen'}
+                  </button>
+                  {powerMeasuring && (
+                    <span style={{ fontSize: 12, color: '#e07b00' }}>
+                      Bereich im Diagramm mit der Maus aufziehen
+                    </span>
+                  )}
+                </div>
+
+                <PowerStreamChart
+                  stream={power.stream}
+                  viewWindow={powerViewWindow}
+                  bucketMs={powerViewWindow
+                    ? powerBucketSeconds(powerViewWindow.fromMs, powerViewWindow.toMs) * 1000
+                    : 1000}
+                  live={powerLive}
+                  measuring={powerMeasuring}
+                  selections={power.selections}
+                  onWindowChange={setPowerViewWindow}
+                  onMeasure={handlePowerMeasure}
+                />
+
+                {/* Verbrauchs-Auswertung: Vorschau + Speichern */}
+                {powerPending && powerChargePreview && (
+                  <div style={{
+                    margin: '12px 0', padding: 10, border: '1px solid #e07b00',
+                    borderRadius: 8, background: '#fff8f0', fontSize: 13
+                  }}>
+                    <strong>Auswertung</strong> ({new Date(powerPending.fromMs).toLocaleTimeString('de-DE')}
+                    {' '}– {new Date(powerPending.toMs).toLocaleTimeString('de-DE')}):
+                    {' '}{(powerChargePreview.charge_uah / 1000).toFixed(3)} mAh
+                    {' '}· {powerChargePreview.duration_s.toFixed(1)} s gemessen
+                    {' '}· Ø {powerChargePreview.mean_ma.toFixed(1)} mA
+                    {powerChargePreview.gaps > 0 && (
+                      <span style={{ color: '#b45309' }}> · {powerChargePreview.gaps} Datenlücke(n)</span>
+                    )}
+                    <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                      <input
+                        type="text"
+                        placeholder="Label (z. B. Firmware v2)"
+                        value={measureLabel}
+                        onChange={(e) => setMeasureLabel(e.target.value)}
+                        maxLength={100}
+                        style={{ flex: 1, fontSize: 13, padding: '4px 8px', borderRadius: 6, border: '1px solid #ccc' }}
+                      />
+                      <button
+                        onClick={handlePowerSaveMeasure}
+                        style={{
+                          padding: '4px 12px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
+                          border: '1px solid #ccc', background: '#fff',
+                        }}
+                      >
+                        Speichern
+                      </button>
+                      <button
+                        onClick={() => { setPowerPending(null); setPowerChargePreview(null); }}
+                        style={{
+                          padding: '4px 12px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
+                          border: '1px solid #ccc', background: '#fff',
+                        }}
+                      >
+                        Verwerfen
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Gespeicherte Verbrauchs-Bereiche (Vergleichstabelle) */}
+                <h4 style={{ margin: '16px 0 8px' }}>
+                  Gespeicherte Bereiche ({power.selections.length})
+                </h4>
+                {power.selections.length === 0 ? (
+                  <p style={{ fontSize: 13, color: '#888', margin: 0 }}>
+                    Noch keine Bereiche gespeichert – mit „Verbrauch messen" einen
+                    Zeitbereich markieren und speichern.
+                  </p>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ textAlign: 'left', borderBottom: '2px solid #ddd' }}>
+                        <th style={{ padding: '4px 8px' }}>Label</th>
+                        <th style={{ padding: '4px 8px' }}>Zeitraum</th>
+                        <th style={{ padding: '4px 8px' }}>Dauer</th>
+                        <th style={{ padding: '4px 8px' }}>Ø Strom</th>
+                        <th style={{ padding: '4px 8px' }}>Verbrauch</th>
+                        <th style={{ padding: '4px 8px' }}></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {power.selections.map((sel) => (
+                        <tr key={sel.id} style={{ borderBottom: '1px solid #eee' }}>
+                          <td style={{ padding: '4px 8px' }}>{sel.label ?? 'Bereich'}</td>
+                          <td style={{ padding: '4px 8px' }}>
+                            {sel.from_ts.slice(11, 19)} – {sel.to_ts.slice(11, 19)}
+                            <span style={{ color: '#999' }}> ({sel.from_ts.slice(0, 10)})</span>
+                          </td>
+                          <td style={{ padding: '4px 8px' }}>
+                            {sel.duration_s >= 90
+                              ? `${(sel.duration_s / 60).toFixed(1)} min`
+                              : `${sel.duration_s.toFixed(1)} s`}
+                          </td>
+                          <td style={{ padding: '4px 8px' }}>{sel.mean_ma.toFixed(1)} mA</td>
+                          <td style={{ padding: '4px 8px' }}>
+                            <strong>{(sel.charge_uah / 1000).toFixed(3)} mAh</strong>
+                          </td>
+                          <td style={{ padding: '4px 8px' }}>
+                            <button
+                              onClick={() => power.deleteSelection(powerLogger, sel.id)}
+                              aria-label={`Bereich ${sel.label ?? sel.id} löschen`}
+                              style={{
+                                border: 'none', background: 'none', color: '#d32f2f',
+                                cursor: 'pointer', fontSize: 13
+                              }}
+                            >
+                              Löschen
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </>
             ) : (
               <div style={{ color: '#888', fontSize: '1.8vh' }}>
-                Logger auswaehlen, um die Zyklus-Analyse zu sehen.
+                Logger auswaehlen, um den Strom-Stream zu sehen.
               </div>
             )}
           </div>

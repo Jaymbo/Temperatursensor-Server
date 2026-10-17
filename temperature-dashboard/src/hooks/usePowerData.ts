@@ -2,69 +2,74 @@ import { useCallback, useState } from "react";
 import { buildApiUrl } from "../api";
 
 /**
- * Laedt die Strom-Zyklusanalyse vom Server (/power/loggers, /power/cycles).
+ * Datenversorgung des Strom-Panels (kontinuierlicher Stream-Modus).
  *
- * Wie useBatteryData bewusst getrennt: Die Strom-Rohproben haben ein ganz
- * anderes Zeit-Raster (200 Hz Dauerstream) als die Temperatur-/Akku-Daten.
- * Die Auswertung (Zyklus-Trigger, Phasen, Overlay) macht das Backend
- * (backend/power_cycles.py) - hier kommen nur die aufbereiteten Daten an.
+ * Anders als die fruehere Zyklus-Overlay-Ansicht (Trigger + Phasen) zeigt
+ * das Strom-Panel jetzt eine durchgehende Strom-Kurve ueber der Absolutezeit:
+ *   - /power/stream/{logger}  -> Zeit-Buckets (min/max/mean) + Session-Baender
+ *   - /power/charge/{logger}  -> Ladung (Trapez-Integration) fuer einen Bereich
+ *   - /power/selections/...   -> gespeicherte Verbrauchs-Bereiche (persistiert)
+ *   - /power/window/{logger}  -> definiertes Zoomfenster einer Session
+ *
+ * Die Auswertung (Integration, Bucket-Bildung, Session-Zuordnung) macht das
+ * Backend - hier kommen nur die aufbereiteten Daten an.
  */
 
-export interface PowerLandmark {
-  start_s: number;
-}
-
-export interface PowerPhase {
-  start_s: number;
-  end_s: number;
-  duration_s: number;
-}
-
-export interface PowerCycle {
-  start: string;
-  duration_s: number;
-  peak_ma: number;
-  truncated: boolean;
-  gap: boolean;
-  landmarks: Record<string, PowerLandmark | null>;
-  phases: Record<string, PowerPhase>;
-  t_s: number[];
-  ma: number[];
-}
-
-export interface PowerPhaseStat {
+/** Ein Zeit-Bucket des Streams (min/max erhalten Spikes, mean traegt Ladung). */
+export interface PowerBucket {
+  /** Bucket-Start, absolut in Epoch-Millisekunden. */
+  t_ms: number;
+  ma_min: number;
+  ma_max: number;
+  ma_mean: number;
+  /** Anzahl Rohproben im Bucket (0-Proben-Buckets kommen nicht an). */
   n: number;
-  min_s: number;
-  median_s: number;
-  max_s: number;
 }
 
-/** Session-Durchschnitt (Standard-Ansicht): Mittelwert +/- Standardabw. */
-export interface PowerSessionAvg {
-  session_id: number | null;
-  n_cycles: number;
-  t_s: number[];
-  mean: number[];
-  std: number[];
-  duration_median_s: number;
-  peak_ma_median: number;
-  landmarks: Record<string, PowerLandmark | null>;
-  phases: Record<string, PowerPhase>;
+/** Session-Hintergrundband (Firmware-/Konfigurations-Abschnitt im Stream). */
+export interface PowerStreamSession {
+  id: number;
+  sensor_id: number | null;
+  start_time: string;
+  /** Ende = Start der naechsten Session; null = offenes Ende (aktuellste). */
+  end_time: string | null;
+  start_ms: number;
+  end_ms: number | null;
+  custom_text: string | null;
 }
 
-/** Zusammenfassung einer Session im Firmware-Versionsvergleich. */
-export interface PowerSessionSummary {
-  session_id: number | null;
-  n_cycles: number;
-  n_cycles_complete: number;
-  charge_uah_total: number;
-  charge_uah_median: number | null;
-  charge_uah_max: number | null;
-  duration_median_s: number | null;
-  peak_ma_median: number | null;
+/** Antwort von /power/stream/{logger}. */
+export interface PowerStream {
+  logger_id: string;
+  buckets: PowerBucket[];
+  from_ts: string;
+  to_ts: string;
+  sessions: PowerStreamSession[];
 }
 
-/** Auswaehlbare Session (Auswahl im Power-Panel). */
+/** Ladungs-Auswertung eines Bereichs (/power/charge). */
+export interface PowerChargeResult {
+  charge_uah: number;
+  duration_s: number;
+  mean_ma: number;
+  n_samples: number;
+  /** Anzahl Datenluecken (> 15 ms ohne Probe) im Bereich. */
+  gaps: number;
+}
+
+/** Gespeicherter Verbrauchs-Bereich (ueber Reloads hinweg persistent). */
+export interface PowerSelection {
+  id: number;
+  label: string | null;
+  from_ts: string;
+  to_ts: string;
+  duration_s: number;
+  mean_ma: number;
+  charge_uah: number;
+  created_at: string;
+}
+
+/** Auswaehlbare Session (Auswahl im Strom-Panel). */
 export interface PowerSessionOption {
   id: number;
   sensor_id: number | null;
@@ -72,18 +77,21 @@ export interface PowerSessionOption {
   custom_text: string | null;
 }
 
-/** Reihenfolge der Phasen fuer die Tabelle (wie im Backend definiert). */
-export const POWER_PHASE_ORDER = ["pre_peak", "spike", "tail"] as const;
-
-export type PowerOverlayMode = "avg" | "cycles";
+/** Definiertes Zoomfenster einer Session (/power/window). */
+export interface PowerWindow {
+  session_id: number;
+  custom_text: string | null;
+  /** Session-Start - 20 s Vorlauf (ISO). */
+  start: string;
+  /** Letzte Messung + 60 s Nachlauf (ISO); null nur bei Live-Follow. */
+  end: string | null;
+}
 
 export const usePowerData = () => {
   const [loggers, setLoggers] = useState<string[]>([]);
-  const [cycles, setCycles] = useState<PowerCycle[]>([]);
-  const [avg, setAvg] = useState<PowerSessionAvg[]>([]);
-  const [stats, setStats] = useState<Record<string, PowerPhaseStat>>({});
-  const [sessions, setSessions] = useState<PowerSessionSummary[]>([]);
   const [sessionOptions, setSessionOptions] = useState<PowerSessionOption[]>([]);
+  const [stream, setStream] = useState<PowerStream | null>(null);
+  const [selections, setSelections] = useState<PowerSelection[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -103,90 +111,20 @@ export const usePowerData = () => {
     }
   }, []);
 
-  const loadCycles = useCallback(async (loggerId: string, overlayLimit = 20,
-                                        window?: { startS: number; endS: number },
-                                        maxPointsPerCycle = 500,
-                                        mode: PowerOverlayMode = "avg",
-                                        sessionIds?: number[]) => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      // Overlay (avg-Kurven oder Zyklen) und Statistik (Phasen-Dauern +
-      // Sessions) parallel. Die Session-Zusammenfassung kommt aus
-      // /power/sessions (Firmware-Versionsvergleich).
-      // Beim Reinzoomen liefert `window` den Ausschnitt (Sekunden seit
-      // Zyklusanfang) - der Server antwortet dann mit voller Aufloesung.
-      const winParams = window
-        ? `&window_start_s=${window.startS}&window_end_s=${window.endS}`
-        : "";
-      const modeParams = buildModeParams(mode, sessionIds);
-      const [overlayRes, cyclesRes, sessionsRes] = await Promise.all([
-        fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}` +
-          `&max_points_per_cycle=${maxPointsPerCycle}${winParams}${modeParams}`)),
-        fetch(buildApiUrl(`/power/cycles/${loggerId}`)),
-        fetch(buildApiUrl(`/power/sessions/${loggerId}`)),
-      ]);
-      if (!overlayRes.ok || !cyclesRes.ok || !sessionsRes.ok) {
-        throw new Error("Fehler beim Laden der Zyklusanalyse.");
-      }
-      const overlay = await overlayRes.json();
-      const cyclesData = await cyclesRes.json();
-      const sessionsData = await sessionsRes.json();
-      setCycles(overlay.cycles || []);
-      setAvg(overlay.avg || []);
-      setStats(cyclesData.stats || {});
-      setSessions(sessionsData.sessions || []);
-    } catch (err) {
-      console.error(err);
-      setError("Fehler beim Laden der Zyklusanalyse.");
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  /**
-   * Nur das Overlay nachladen (Zoom-Nachladen in voller Aufloesung bzw.
-   * Reset auf die Gesamtansicht). Bewusst OHNE /power/cycles und
-   * /power/sessions: Die Statistik aendert sich beim Zoomen nicht und deren
-   * Vollanalyse wuerde das Nachladen unnötig verlangsamen.
-   */
-  const loadOverlay = useCallback(async (loggerId: string,
-                                         window?: { startS: number; endS: number },
-                                         maxPointsPerCycle = 500,
-                                         overlayLimit = 20,
-                                         mode: PowerOverlayMode = "avg",
-                                         sessionIds?: number[]) => {
-    setError(null);
-    try {
-      const winParams = window
-        ? `&window_start_s=${window.startS}&window_end_s=${window.endS}`
-        : "";
-      const modeParams = buildModeParams(mode, sessionIds);
-      const res = await fetch(buildApiUrl(`/power/cycles/${loggerId}/overlay?overlay_limit=${overlayLimit}` +
-        `&max_points_per_cycle=${maxPointsPerCycle}${winParams}${modeParams}`));
-      if (!res.ok) throw new Error("Fehler beim Laden des Overlays.");
-      const overlay = await res.json();
-      setCycles(overlay.cycles || []);
-      setAvg(overlay.avg || []);
-    } catch (err) {
-      console.error(err);
-      setError("Fehler beim Laden des Overlays.");
-    }
-  }, []);
-
-  /**
-   * Auswaehlbare Sessions laden (fuer die Multi-Auswahl im Power-Panel):
-   * Alle Sessions mit Startzeit, neueste zuerst.
-   */
+  /** Auswaehlbare Sessions (neueste zuerst). */
   const loadSessionOptions = useCallback(async () => {
     setError(null);
     try {
       const res = await fetch(buildApiUrl("/sessions"));
       if (!res.ok) throw new Error(`Fehler beim Laden der Sessions: ${res.statusText}`);
       const data = await res.json();
-      const opts: PowerSessionOption[] = (data.sessions || [])
-        .filter((s: any) => s.start_time != null)
-        .map((s: any) => ({
+      const raw: Array<{
+        id: number; sensor_id: number | null; start_time: string;
+        custom_text: string | null;
+      }> = data.sessions || [];
+      const opts: PowerSessionOption[] = raw
+        .filter((s) => s.start_time != null)
+        .map((s) => ({
           id: Number(s.id),
           sensor_id: s.sensor_id ?? null,
           start_time: String(s.start_time),
@@ -201,22 +139,106 @@ export const usePowerData = () => {
     }
   }, []);
 
+  /**
+   * Stream-Buckets fuer ein Zeitfenster laden. `fromIso`/`toIso` sind
+   * ISO-Zeitstempel; `bucketS` die Bucket-Dauer in Sekunden (Frontend
+   * passt sie an den Zoom-Level an: eng gezoomt = feinere Buckets).
+   */
+  const loadStream = useCallback(async (
+    loggerId: string, fromIso: string, toIso: string, bucketS: number,
+  ) => {
+    setError(null);
+    try {
+      const params = new URLSearchParams({
+        from_ts: fromIso, to_ts: toIso, bucket_s: String(bucketS),
+      });
+      const res = await fetch(buildApiUrl(`/power/stream/${loggerId}?${params}`));
+      if (!res.ok) throw new Error(`Fehler beim Laden des Streams: ${res.statusText}`);
+      setStream(await res.json());
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Laden der Stromdaten.");
+    }
+  }, []);
+
+  /** Gespeicherte Verbrauchs-Bereiche laden (neueste zuerst). */
+  const loadSelections = useCallback(async (loggerId: string) => {
+    setError(null);
+    try {
+      const res = await fetch(buildApiUrl(`/power/selections/${loggerId}`));
+      if (!res.ok) throw new Error(`Fehler beim Laden der Bereiche: ${res.statusText}`);
+      const data = await res.json();
+      setSelections(data.selections || []);
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Laden der gespeicherten Bereiche.");
+    }
+  }, []);
+
+  /**
+   * Markierten Bereich speichern. Die Auswertung (Ladung/Dauer/Mittelstrom)
+   * berechnet das Backend - hier geht nur der Zeitraum + Label raus.
+   * @return Die gespeicherte Auswertung (fuer Sofort-Anzeige) oder null.
+   */
+  const saveSelection = useCallback(async (
+    loggerId: string, fromIso: string, toIso: string, label: string | null,
+  ): Promise<PowerChargeResult | null> => {
+    setError(null);
+    try {
+      const res = await fetch(buildApiUrl(`/power/selections/${loggerId}`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from_ts: fromIso, to_ts: toIso, label }),
+      });
+      if (!res.ok) throw new Error(`Fehler beim Speichern: ${res.statusText}`);
+      const data = await res.json();
+      await loadSelections(loggerId);
+      return data as PowerChargeResult;
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Speichern des Bereichs.");
+      return null;
+    }
+  }, [loadSelections]);
+
+  /** Gespeicherten Bereich loeschen (Liste laedt neu). */
+  const deleteSelection = useCallback(async (loggerId: string, id: number) => {
+    setError(null);
+    try {
+      const res = await fetch(buildApiUrl(`/power/selections/${loggerId}/${id}`),
+        { method: "DELETE" });
+      if (!res.ok) throw new Error(`Fehler beim Loeschen: ${res.statusText}`);
+      await loadSelections(loggerId);
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Loeschen des Bereichs.");
+    }
+  }, [loadSelections]);
+
+  /**
+   * Definiertes Zoomfenster einer Session holen (Session-Start - 20 s bis
+   * letzte Messung + 60 s). Ohne sessionId: neueste Session (Live-Follow).
+   * @return Das Fenster oder null (Fehler/nicht gefunden).
+   */
+  const loadWindow = useCallback(async (
+    loggerId: string, sessionId?: number,
+  ): Promise<PowerWindow | null> => {
+    setError(null);
+    try {
+      const q = sessionId != null ? `?session_id=${sessionId}` : "";
+      const res = await fetch(buildApiUrl(`/power/window/${loggerId}${q}`));
+      if (!res.ok) return null;
+      return await res.json() as PowerWindow;
+    } catch (err) {
+      console.error(err);
+      setError("Fehler beim Laden des Session-Fensters.");
+      return null;
+    }
+  }, []);
+
   return {
-    loggers, cycles, avg, stats, sessions, sessionOptions,
-    isLoading, error,
-    loadLoggers, loadCycles, loadOverlay, loadSessionOptions,
+    loggers, sessionOptions, stream, selections, isLoading, error,
+    loadLoggers, loadSessionOptions, loadStream,
+    loadSelections, saveSelection, deleteSelection, loadWindow,
   };
 };
-
-/**
- * URL-Parameter fuer Overlay-Modus + Session-Filter:
- * - "avg" (Standard): alle Sessions bzw. die gewaehlten (kommasepariert)
- * - "cycles": klassisches Einzelzyklen-Overlay
- */
-function buildModeParams(mode: PowerOverlayMode, sessionIds?: number[]): string {
-  if (mode === "cycles") return "&mode=cycles";
-  const sidParams = sessionIds && sessionIds.length > 0
-    ? `&session_ids=${sessionIds.join(",")}`
-    : "";
-  return `&mode=avg${sidParams}`;
-}
