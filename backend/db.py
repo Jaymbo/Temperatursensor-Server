@@ -354,8 +354,14 @@ def get_power_charge(logger_id: str, from_ts: str, to_ts: str) -> dict:
     Ladung (µAh) im Bereich [from_ts, to_ts] per Trapez-Integration der
     Rohproben. Vorzeichen: Entladen positiv, Laden negativ.
 
+    Datenluecken (> 3x 5-ms-Raster) werden UEBERBRUECKT: Die Luecken-Zeit
+    zaehlt zur Dauer und wird mit dem Mittelwert aus der letzten Probe vor
+    und der ersten Probe nach der Luecke integriert (Trapez ueber die Luecke).
+    Der Sensor hat auch waehrend der Sendepause Strom gezogen - das wird
+    damit geschaetzt statt als 0 zu zählen. Die Anzahl der Luecken wird als
+    `gaps` gemeldet (Transparenz ueber den Schaetzanteil).
+
     @return {charge_uah, duration_s, mean_ma, n_samples, gaps}
-      gaps = Anzahl sichtbarer Datenluecken (> 3x 5-ms-Raster).
     """
     conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
     cursor = conn.cursor()
@@ -378,11 +384,11 @@ def get_power_charge(logger_id: str, from_ts: str, to_ts: str) -> dict:
             continue
         if prev_t is not None:
             dt = (t - prev_t).total_seconds()
-            # Luecke (> 3x 5-ms-Raster): Zeit nicht mit zaehlen (es floss
-            # kein gemessener Strom), aber als Luecke markieren.
+            # Luecke (> 3x 5-ms-Raster): als Luecke markieren, Zeit aber
+            # MIT zaehlen und per Trapez (Mittelwert davor/danach) ueberbruecken
+            # -> Verbrauch der Sendepause geschaetzt statt 0.
             if dt > 0.015:
                 gaps += 1
-                dt = 0.0
             # mA*s -> uAh: 1 mA*s = 1000 uA*s = 1000/3600 uAh = 1/3.6 uAh
             charge_uah += (prev_ma + float(ma)) / 2.0 * dt / 3.6
             duration_s += dt

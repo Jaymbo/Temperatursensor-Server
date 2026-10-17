@@ -1363,8 +1363,9 @@ def power_charge_endpoint(logger_id: str, payload: dict):
     Ladung (Verbrauch) in einem Zeitbereich: Trapez-Integration der Rohproben.
 
     Erwartet {from_ts, to_ts} (ISO). Vorzeichen: Entladen positiv, Laden
-    negativ. Gaps (> 15 ms ohne Probe) zaehlen nicht zur Dauer, werden aber
-    gemeldet (gaps) - die Auswertung ist damit auch ueber lange Bereiche
+    negativ. Gaps (> 15 ms ohne Probe) werden mit dem Mittelwert aus der
+    Probe davor und danach ueberbrueckt (durchgehend gerechnet) und als
+    `gaps` gemeldet - die Auswertung ist damit auch ueber lange Bereiche
     vergleichbar (mAh + Dauer + Mittelstrom).
     """
     from_ts = payload.get("from_ts")

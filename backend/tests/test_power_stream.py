@@ -176,7 +176,7 @@ def test_charge_trapezoid_integration(client):
     assert data["mean_ma"] == pytest.approx(50.0)
 
 
-def test_charge_gap_not_counted_in_duration(client):
+def test_charge_gap_is_bridged(client):
     now = datetime.datetime.now()
     # 100 Proben, dann 1 s Pause (Luecke), dann wieder 100 Proben - alles in
     # EINEM POST (ein received_at), damit die Luecke nicht durch
@@ -189,10 +189,15 @@ def test_charge_gap_not_counted_in_duration(client):
         "to_ts": (now + datetime.timedelta(seconds=4)).isoformat()})
     data = res.json()
     assert data["gaps"] == 1
-    # Dauer = 0,495 + 0,495 (Luecke zaehlt nicht)
-    assert data["duration_s"] == pytest.approx(0.99)
-    expected = (99 * 0.005 * 50.0 + 99 * 0.005 * 30.0) / 3.6
-    assert data["charge_uah"] == pytest.approx(expected, rel=1e-6)
+    # Luecke wird UEBERBRUECKT: Dauer = 0,495 + 1,0 + 0,495 = 1,99 s
+    assert data["duration_s"] == pytest.approx(1.99)
+    # Trapez je Intervall (99 @ 5 ms @ 50 mA, 1 Luecken-Intervall @ 1 s mit
+    # Mittelwert (50+30)/2 = 40 mA, 99 @ 5 ms @ 30 mA)
+    expected = (99 * 0.005 * 50.0 + 1.0 * 40.0 + 99 * 0.005 * 30.0) / 3.6
+    # charge_uah ist in der Response auf 3 Dezimalen gerundet
+    assert data["charge_uah"] == pytest.approx(expected, abs=0.001)
+    # Mittelstrom ueber die GESAMTE Dauer (inkl. ueberbrueckter Luecke)
+    assert data["mean_ma"] == pytest.approx(expected / (1.99 / 3.6), rel=1e-3)
 
 
 def test_charge_validation_and_empty(client):
