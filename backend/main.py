@@ -17,6 +17,8 @@ from db import (
     # Strommessung
     add_power_measurements, add_power_aggregate, get_power_aggregates,
     get_power_measurements, get_power_logger_ids, get_sessions_chronological,
+    get_power_stream_buckets, get_power_charge,
+    add_power_selection, get_power_selections, delete_power_selection,
 )
 import db
 import power_cycles
@@ -1210,6 +1212,202 @@ def power_history(logger_id: str, since: str | None = None, limit: int | None = 
         "aggregates": get_power_aggregates(logger_id, since=since),
         "measurements": get_power_measurements(logger_id, since=since, limit=limit),
     }
+
+
+@app.get("/power/stream/{logger_id}")
+def power_stream_endpoint(
+    logger_id: str,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    bucket_s: float = 1.0,
+):
+    """
+    Kontinuierlicher Strom-Stream als Zeit-Buckets (Downsampling).
+
+    from_ts/to_ts: ISO-Zeitstempel (Default: letzte 120 s bis jetzt).
+    bucket_s: Bucket-Dauer in Sekunden (Default 1 s = 200 Rohproben bei
+    200 Hz). Pro Bucket min/max/mean + Probenanzahl (min/max erhalten
+    WLAN-Spikes, mean traegt die Ladung). Zoomt das Frontend naeher, wird
+    bucket_s verkleinert (feinere Aufloesung).
+
+    sessions: Session-Zuordnung fuer Hintergrund-Baender [{id, start_time,
+    custom_text}] - alle Sessions, deren Zeitraum das Fenster schneidet.
+    """
+    if bucket_s <= 0 or bucket_s > 60:
+        raise HTTPException(status_code=422, detail="bucket_s muss zwischen 0 und 60 liegen.")
+    now = datetime.datetime.now()
+    if to_ts is None:
+        to_dt = now
+    else:
+        to_dt = _parse_iso_or_422(to_ts, "to_ts")
+    if from_ts is None:
+        from_dt = to_dt - datetime.timedelta(seconds=120)
+    else:
+        from_dt = _parse_iso_or_422(from_ts, "from_ts")
+    if from_dt >= to_dt:
+        raise HTTPException(status_code=422, detail="from_ts muss vor to_ts liegen.")
+    buckets = get_power_stream_buckets(
+        logger_id, from_dt.isoformat(), to_dt.isoformat(), bucket_s=bucket_s)
+    sessions = _sessions_overlapping(from_dt, to_dt)
+    return {
+        "logger_id": logger_id,
+        "buckets": buckets,
+        "from_ts": from_dt.isoformat(),
+        "to_ts": to_dt.isoformat(),
+        "sessions": sessions,
+    }
+
+
+def _parse_iso_or_422(value: str, name: str) -> datetime.datetime:
+    """ISO-Zeitstempel parsen; 422 bei ungueltigem Format."""
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail=f"{name} ist kein gueltiger ISO-Zeitstempel.")
+
+
+def _sessions_overlapping(from_dt: datetime.datetime,
+                          to_dt: datetime.datetime) -> list[dict]:
+    """
+    Alle Sessions, deren [start_time, naechste Session) das Fenster schneidet.
+    Fuer die Hintergrund-Faerbung im Stream-Chart.
+    """
+    sessions = db.get_sessions_chronological()
+    out = []
+    for i, s in enumerate(sessions):
+        start = s.get("start_time")
+        start_dt = _parse_iso_or_422(start, "start_time") if start else None
+        if start_dt is None:
+            continue
+        end_dt = _parse_iso_or_422(sessions[i + 1]["start_time"], "start_time") \
+            if i + 1 < len(sessions) else None
+        # Session endet mit dem Start der naechsten (oder reicht offen weiter).
+        if end_dt is not None and end_dt <= from_dt:
+            continue  # endet vor dem Fenster
+        if start_dt > to_dt:
+            continue  # beginnt nach dem Fenster
+        out.append({
+            "id": s["id"],
+            "sensor_id": s.get("sensor_id"),
+            "start_time": start,
+            "end_time": end_dt.isoformat() if end_dt else None,
+            "start_ms": round(start_dt.timestamp() * 1000.0),
+            "end_ms": round(end_dt.timestamp() * 1000.0) if end_dt else None,
+            "custom_text": s.get("custom_text"),
+        })
+    return out
+
+
+@app.get("/power/window/{logger_id}")
+def power_window_endpoint(logger_id: str, session_id: int | None = None):
+    """
+    Definiertes Zoomfenster fuer eine Session (Session-Klick im Strom-Panel):
+    Start = Session-Start - 20 s Vorlauf, Ende = letzte Messung + 60 s
+    Nachlauf (ohne Messungen: Start + 60 s). Ohne session_id: die neueste
+    Session mit Stromdaten im Fenster (Live-Follow).
+    """
+    sessions = db.get_sessions_chronological()
+    if session_id is None:
+        # Neueste Session: spaeteste start_time <= jetzt (Live-Follow).
+        now = datetime.datetime.now()
+        chosen = None
+        for s in sessions:
+            start = _parse_iso_or_422(s["start_time"], "start_time")
+            if start is not None and start <= now:
+                chosen = s
+        if chosen is None:
+            raise HTTPException(status_code=404, detail="Keine Session gefunden.")
+        window = {"start": chosen["start_time"], "end": None}
+        return {"session_id": chosen["id"], "custom_text": chosen.get("custom_text"), **window}
+    chosen = next((s for s in sessions if s["id"] == session_id), None)
+    if chosen is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} nicht gefunden.")
+    start_dt = _parse_iso_or_422(chosen["start_time"], "start_time")
+    window_start = (start_dt - datetime.timedelta(seconds=20)).isoformat()
+    # Ende: letzte Rohprobe der Session (bzw. Start + 60 s ohne Messungen).
+    next_start = None
+    for s in sessions:
+        s_start = _parse_iso_or_422(s["start_time"], "start_time") if s.get("start_time") else None
+        if s_start is not None and s_start > start_dt:
+            next_start = s_start
+            break
+    upper = next_start if next_start is not None else datetime.datetime.now()
+    last = db.get_power_last_measurement_ts(logger_id, upper.isoformat())
+    if last is not None:
+        window_end = (datetime.datetime.fromisoformat(last)
+                      + datetime.timedelta(seconds=60)).isoformat()
+    else:
+        window_end = (start_dt + datetime.timedelta(seconds=60)).isoformat()
+    return {
+        "session_id": session_id,
+        "custom_text": chosen.get("custom_text"),
+        "start": window_start,
+        "end": window_end,
+    }
+
+
+@app.post("/power/charge/{logger_id}")
+def power_charge_endpoint(logger_id: str, payload: dict):
+    """
+    Ladung (Verbrauch) in einem Zeitbereich: Trapez-Integration der Rohproben.
+
+    Erwartet {from_ts, to_ts} (ISO). Vorzeichen: Entladen positiv, Laden
+    negativ. Gaps (> 15 ms ohne Probe) zaehlen nicht zur Dauer, werden aber
+    gemeldet (gaps) - die Auswertung ist damit auch ueber lange Bereiche
+    vergleichbar (mAh + Dauer + Mittelstrom).
+    """
+    from_ts = payload.get("from_ts")
+    to_ts = payload.get("to_ts")
+    if not from_ts or not to_ts:
+        raise HTTPException(status_code=422, detail="from_ts und to_ts sind erforderlich.")
+    from_dt = _parse_iso_or_422(from_ts, "from_ts")
+    to_dt = _parse_iso_or_422(to_ts, "to_ts")
+    if from_dt >= to_dt:
+        raise HTTPException(status_code=422, detail="from_ts muss vor to_ts liegen.")
+    result = get_power_charge(logger_id, from_dt.isoformat(), to_dt.isoformat())
+    return {"logger_id": logger_id, "from_ts": from_dt.isoformat(),
+            "to_ts": to_dt.isoformat(), **result}
+
+
+@app.get("/power/selections/{logger_id}")
+def power_selections_list(logger_id: str):
+    """Gespeicherte Verbrauchs-Bereiche eines Loggers (neueste zuerst)."""
+    return {"selections": get_power_selections(logger_id)}
+
+
+@app.post("/power/selections/{logger_id}")
+def power_selections_add(logger_id: str, payload: dict):
+    """
+    Speichert einen markierten Verbrauchs-Bereich inkl. Auswertung.
+
+    Erwartet {from_ts, to_ts, label?}. Ladung/Dauer/Mittelstrom werden
+    serverseitig berechnet (nicht Client-gesendet) - die gespeicherten
+    Werte sind damit reproduzierbar.
+    """
+    from_ts = payload.get("from_ts")
+    to_ts = payload.get("to_ts")
+    if not from_ts or not to_ts:
+        raise HTTPException(status_code=422, detail="from_ts und to_ts sind erforderlich.")
+    from_dt = _parse_iso_or_422(from_ts, "from_ts")
+    to_dt = _parse_iso_or_422(to_ts, "to_ts")
+    if from_dt >= to_dt:
+        raise HTTPException(status_code=422, detail="from_ts muss vor to_ts liegen.")
+    label = payload.get("label")
+    if label is not None:
+        label = str(label).strip()[:100] or None
+    result = get_power_charge(logger_id, from_dt.isoformat(), to_dt.isoformat())
+    sel_id = add_power_selection(
+        logger_id, label, from_dt.isoformat(), to_dt.isoformat(),
+        result["duration_s"], result["mean_ma"], result["charge_uah"])
+    return {"status": "success", "id": sel_id, **result, "label": label}
+
+
+@app.delete("/power/selections/{logger_id}/{selection_id}")
+def power_selections_delete(logger_id: str, selection_id: int):
+    """Loescht einen gespeicherten Verbrauchs-Bereich."""
+    if not delete_power_selection(logger_id, selection_id):
+        raise HTTPException(status_code=404, detail="Bereich nicht gefunden.")
+    return {"status": "success"}
 
 
 @app.get("/power/cycles/{logger_id}")

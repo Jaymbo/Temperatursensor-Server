@@ -264,6 +264,199 @@ def _create_power_tables(cursor):
         "ON power_aggregates (logger_id, window_start)"
     )
 
+    # power_selections: gespeicherte Verbrauchs-Bereiche (Strom-Panel).
+    # Der User markiert im Stream-Chart einen Zeitbereich, die Ladung wird
+    # serverseitig integriert und der Bereich bleibt ueber Frontend-Reloads
+    # hinweg erhalten (Vergleich mehrerer Firmware-Versionen / Konfigurationen).
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS power_selections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logger_id TEXT NOT NULL,
+            label TEXT,
+            from_ts TEXT NOT NULL,
+            to_ts TEXT NOT NULL,
+            duration_s REAL,
+            mean_ma REAL,
+            charge_uah REAL,
+            created_at TEXT NOT NULL
+        )"""
+    )
+
+
+# --- Strom-Stream: Bucket-Downsampling + Bereichsladung ----------------------
+
+def get_power_stream_buckets(logger_id: str, from_ts: str, to_ts: str,
+                             bucket_s: float = 1.0) -> list[dict]:
+    """
+    Rohproben eines Loggers als Zeit-Buckets (Downsampling fuer den Stream).
+
+    Pro Bucket (Default 1 s = 200 Rohproben) kommen min/max/mean des Stroms:
+    min/max erhalten Spikes (WLAN-Bursts bleiben sichtbar), mean ist die
+    Bucket-Ladungs-Grundlage (mean * bucket_dauer = Ladung). Zusatzlich die
+    Rohproben-Anzahl je Bucket (fuer Luecken-Erkennung).
+
+    Buckets ohne Proben erscheinen nicht (Frontend zeichnet die Luecke).
+    SQLite-String-Vergleich reicht: ISO-Zeitstempel mit fester Laenge
+    sortieren lexikographisch korrekt.
+
+    t_ms ist ABSOLUT (Epoch-Millisekunden, Bucket-Grenze = floor(unix_s /
+    bucket_s)) - Buckets bleiben damit ueber mehrere Requests hinweg stabil
+    (Live-Polling verschiebt das Fenster, aber nicht die Bucket-Grenzen).
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT measured_at, current_ma FROM power_measurements "
+        "WHERE logger_id = ? AND measured_at >= ? AND measured_at <= ? "
+        "ORDER BY measured_at ASC",
+        (logger_id, from_ts, to_ts),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return _bucket_power_rows(rows, bucket_s)
+
+
+def _bucket_power_rows(rows: list[tuple], bucket_s: float) -> list[dict]:
+    """Proby-Sortierte Rows -> [{t_start, ma_min, ma_max, ma_mean, n}] je Bucket."""
+    if bucket_s <= 0:
+        raise ValueError("bucket_s muss positiv sein.")
+    buckets: dict[int, list[float]] = {}
+    for measured_at, ma in rows:
+        t = _parse_iso_ts(measured_at)
+        if t is None or ma is None:
+            continue
+        key = int(t.timestamp() // bucket_s)
+        buckets.setdefault(key, []).append(float(ma))
+    out = []
+    for key in sorted(buckets):
+        vals = buckets[key]
+        out.append({
+            "t_ms": round(key * bucket_s * 1000.0),
+            "ma_min": min(vals),
+            "ma_max": max(vals),
+            "ma_mean": sum(vals) / len(vals),
+            "n": len(vals),
+        })
+    return out
+
+
+def _parse_iso_ts(value):
+    """ISO-Zeitstempel -> datetime (None bei ungueltigem Input)."""
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_power_charge(logger_id: str, from_ts: str, to_ts: str) -> dict:
+    """
+    Ladung (µAh) im Bereich [from_ts, to_ts] per Trapez-Integration der
+    Rohproben. Vorzeichen: Entladen positiv, Laden negativ.
+
+    @return {charge_uah, duration_s, mean_ma, n_samples, gaps}
+      gaps = Anzahl sichtbarer Datenluecken (> 3x 5-ms-Raster).
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT measured_at, current_ma FROM power_measurements "
+        "WHERE logger_id = ? AND measured_at >= ? AND measured_at <= ? "
+        "ORDER BY measured_at ASC",
+        (logger_id, from_ts, to_ts),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    charge_uah = 0.0
+    duration_s = 0.0
+    n = 0
+    gaps = 0
+    prev_t = None
+    for measured_at, ma in rows:
+        t = _parse_iso_ts(measured_at)
+        if t is None or ma is None:
+            continue
+        if prev_t is not None:
+            dt = (t - prev_t).total_seconds()
+            # Luecke (> 3x 5-ms-Raster): Zeit nicht mit zaehlen (es floss
+            # kein gemessener Strom), aber als Luecke markieren.
+            if dt > 0.015:
+                gaps += 1
+                dt = 0.0
+            # mA*s -> uAh: 1 mA*s = 1000 uA*s = 1000/3600 uAh = 1/3.6 uAh
+            charge_uah += (prev_ma + float(ma)) / 2.0 * dt / 3.6
+            duration_s += dt
+        n += 1
+        prev_t = t
+        prev_ma = float(ma)
+    mean_ma = (charge_uah / (duration_s / 3.6)) if duration_s > 0 else 0.0
+    return {
+        "charge_uah": round(charge_uah, 3),
+        "duration_s": round(duration_s, 3),
+        "mean_ma": round(mean_ma, 3),
+        "n_samples": n,
+        "gaps": gaps,
+    }
+
+
+# --- Gespeicherte Verbrauchs-Bereiche ----------------------------------------
+
+def add_power_selection(logger_id: str, label: str | None, from_ts: str,
+                        to_ts: str, duration_s: float, mean_ma: float,
+                        charge_uah: float) -> int:
+    """Speichert einen Verbrauchs-Bereich und liefert seine ID."""
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO power_selections "
+        "(logger_id, label, from_ts, to_ts, duration_s, mean_ma, charge_uah, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            logger_id, label, from_ts, to_ts, float(duration_s),
+            float(mean_ma), float(charge_uah),
+            datetime.datetime.now().isoformat(),
+        ),
+    )
+    sel_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return int(sel_id)
+
+
+def get_power_selections(logger_id: str) -> list[dict]:
+    """Gespeicherte Bereiche eines Loggers (neueste zuerst)."""
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, label, from_ts, to_ts, duration_s, mean_ma, charge_uah, created_at "
+        "FROM power_selections WHERE logger_id = ? ORDER BY id DESC",
+        (logger_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0], "label": r[1], "from_ts": r[2], "to_ts": r[3],
+            "duration_s": r[4], "mean_ma": r[5], "charge_uah": r[6],
+            "created_at": r[7],
+        }
+        for r in rows
+    ]
+
+
+def delete_power_selection(logger_id: str, selection_id: int) -> bool:
+    """Loescht einen Bereich. @return True, wenn eine Zeile geloescht wurde."""
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM power_selections WHERE logger_id = ? AND id = ?",
+        (logger_id, selection_id),
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted > 0
+
 
 def _is_valid_battery_mv(mv) -> bool:
     """Plausibilitaetsgrenzen fuer Akku-Millivolt (siehe Firmware config.h)."""
@@ -1154,6 +1347,24 @@ def get_power_measurements(logger_id: str, since: str | None = None,
         }
         for r in rows
     ]
+
+
+def get_power_last_measurement_ts(logger_id: str, before_ts: str | None = None) -> str | None:
+    """
+    Zeitstempel der letzten Rohprobe eines Loggers (optional vor before_ts).
+    Fuer das Session-Zoomfenster (Ende = letzte Messung + Nachlauf).
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)
+    cursor = conn.cursor()
+    sql = ("SELECT MAX(measured_at) FROM power_measurements WHERE logger_id = ?")
+    params: list = [logger_id]
+    if before_ts is not None:
+        sql += " AND measured_at <= ?"
+        params.append(before_ts)
+    cursor.execute(sql, params)
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
 
 
 def get_power_logger_ids() -> list[str]:
