@@ -39,8 +39,8 @@ function App() {
   const [showHelp, setShowHelp] = useState<boolean>(false);
   const [showAddSensor, setShowAddSensor] = useState<boolean>(false);
   const [newSensorName, setNewSensorName] = useState<string>("");
-  const [newSensorInterval, setNewSensorInterval] = useState<number>(60);
-  const [newSensorBuffer, setNewSensorBuffer] = useState<number>(10);
+  const [newSensorInterval, setNewSensorInterval] = useState<number>(10);
+  const [newSensorBuffer, setNewSensorBuffer] = useState<number>(6);
   const [updateInfo, setUpdateInfo] = useState<{available: boolean, changelog: string, commitsBehind: number} | null>(null);
   const [showChangelog, setShowChangelog] = useState<boolean>(false);
   const [updating, setUpdating] = useState<boolean>(false);
