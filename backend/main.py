@@ -596,8 +596,8 @@ async def update_sensor_session(sensor_id: str):
             "calibration_data": result["calibration_data"],
             "calibration_hw_rev": get_session_hw_rev(sensor_id),
             "correction_points": result.get("correction_points"),
-            "messintervall": result.get("messintervall", 60.0),
-            "sendpuffer": result.get("sendpuffer", 10)
+            "messintervall": result.get("messintervall", 10.0),
+            "sendpuffer": result.get("sendpuffer", 6)
         }
     except ValueError as e:
         return {"status": "error", "message": str(e)}
@@ -618,7 +618,7 @@ async def start_sensor(payload: dict):
     try:
         custom_text = payload.get("custom_text", "")
         messintervall = payload.get("messintervall", 10.0)
-        sendpuffer = payload.get("sendpuffer", 60)
+        sendpuffer = payload.get("sendpuffer", 6)
         entry_id = f"None_{add_or_update_custom_text_entry(custom_text, messintervall, sendpuffer)}"
         print(f"Custom text: {custom_text}")  # Debugging-Log
         print(f"Neuer Eintrag erstellt oder aktualisiert: {entry_id}")  # Debugging-Log

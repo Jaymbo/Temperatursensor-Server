@@ -34,7 +34,7 @@ def initialize_db():
             calibration_data TEXT,
             custom_text TEXT,
             messintervall REAL DEFAULT 10.0,
-            sendpuffer INTEGER DEFAULT 60
+            sendpuffer INTEGER DEFAULT 6
         )
         """
     )
@@ -91,7 +91,7 @@ def initialize_db():
     if "messintervall" not in columns:  # pragma: no cover (Migration, Spalte existiert bereits im CREATE TABLE)
         cursor.execute("ALTER TABLE sessions ADD COLUMN messintervall REAL DEFAULT 10.0")  # pragma: no cover
     if "sendpuffer" not in columns:  # pragma: no cover (Migration, Spalte existiert bereits im CREATE TABLE)
-        cursor.execute("ALTER TABLE sessions ADD COLUMN sendpuffer INTEGER DEFAULT 60")  # pragma: no cover
+        cursor.execute("ALTER TABLE sessions ADD COLUMN sendpuffer INTEGER DEFAULT 6")  # pragma: no cover
     if "correction_points" not in columns:
         cursor.execute("ALTER TABLE sessions ADD COLUMN correction_points TEXT")
     if "hw_rev" not in columns:
@@ -529,7 +529,7 @@ def process_relative_data(timestamps: list[float], temperatures: list[float]):
 
     return absolute_timestamps, absolute_temperatures
 
-def clone_latest_session_with_calibration(sensor_id: str, messintervall: float = 10.0, sendpuffer: int = 60):
+def clone_latest_session_with_calibration(sensor_id: str, messintervall: float = 10.0, sendpuffer: int = 6):
     """Erstellt eine neue Session für einen Sensor.
 
     Regeln:
@@ -703,14 +703,14 @@ def apply_time_factor(timestamp: str, start_time: str | None, factor: float) -> 
     return corrected.isoformat()
 
 
-def add_or_update_custom_text_entry(custom_text: str, messintervall: float = 10.0, sendpuffer: int = 60):
+def add_or_update_custom_text_entry(custom_text: str, messintervall: float = 10.0, sendpuffer: int = 6):
     """
     Fügt einen neuen Eintrag mit nur custom_text hinzu oder überschreibt den neuesten bestehenden Eintrag,
     bei dem nur id und custom_text gefüllt sind und der Rest leer ist.
 
     :param custom_text: Der benutzerdefinierte Text für den Eintrag.
-    :param messintervall: Intervall zwischen Messungen in Sekunden (Default: 60.0)
-    :param sendpuffer: Anzahl der Messpunkte vor dem Senden (Default: 10)
+    :param messintervall: Intervall zwischen Messungen in Sekunden (Default: 10.0)
+    :param sendpuffer: Anzahl der Messpunkte vor dem Senden (Default: 6)
     :return: Die ID des Eintrags.
     """
     conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT_S)

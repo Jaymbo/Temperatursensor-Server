@@ -341,3 +341,63 @@ def test_power_history_unknown(client):
     res = client.get("/power/unbekannt")
     assert res.json()["measurements"] == []
     assert res.json()["aggregates"] == []
+
+
+# ── /measurements Diagnose-Log (device_diagnostics) ─────────────────────
+
+def test_measurements_diag_log_written(client):
+    """Diagnose-Zaehler landen in device_diagnostics (Commit 592ca7e)."""
+    _ensure_session("1")
+    res = client.post("/measurements", json={
+        "sensor_id": "1",
+        "timestamps": [0, 100],
+        "temperatures": [22.5, 0.1],
+        "diag_boot": 42,
+        "diag_rtc_entries": 3,
+        "diag_uptime_s": 123.4,
+        "diag_send_every": 6,
+        "diag_messintervall_s": 10.0,
+        "diag_sleep_s": 6.0,
+    })
+    assert res.json()["status"] == "success"
+
+    conn = sqlite3.connect(dbmod.DB_PATH)
+    row = conn.execute(
+        "SELECT sensor_id, boot_count, rtc_entries, send_every, "
+        "messintervall_s, sleep_s FROM device_diagnostics "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    assert row == ("1", 42, 3, 6, 10.0, 6.0)
+
+
+def test_measurements_diag_log_db_error_swallowed(client, monkeypatch):
+    """DB-Fehler im Diagnose-Log duerfen die Messdaten-NICHT verfaelschen
+    (except-Zweig in /measurements)."""
+    _ensure_session("1")
+
+    class DiagBrokenConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *a, **k):
+            if "device_diagnostics" in sql:
+                raise sqlite3.OperationalError("diag kaputt")
+            return self._conn.execute(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    real_connect = sqlite3.connect
+
+    def diag_only_connect(*args, **kwargs):
+        return DiagBrokenConn(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", diag_only_connect)
+    res = client.post("/measurements", json={
+        "sensor_id": "1",
+        "timestamps": [0, 100],
+        "temperatures": [22.5, 0.1],
+        "diag_boot": 7,
+    })
+    assert res.json()["status"] == "success"
