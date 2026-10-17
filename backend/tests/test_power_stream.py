@@ -395,3 +395,25 @@ def test_window_session_end_at_next_session_start(client):
 def _db_conn():
     import db as dbmod
     return dbmod.sqlite3.connect(dbmod.DB_PATH)
+
+
+def test_stream_accepts_utc_z_timestamps(client):
+    """Browser-ISO mit Z-Suffix (UTC) -> auf naive Lokalzeit normalisiert.
+
+    Regression: aware/naive-Vergleich in _sessions_overlapping crashte mit
+    TypeError (Internal Server Error), statt Daten zu liefern.
+    """
+    now = datetime.datetime.now()
+    _post_samples(client, "1", _continuous_pts(now, 400, ma=42.0))
+    from_utc = datetime.datetime.now(datetime.timezone.utc)
+    to_utc = from_utc + datetime.timedelta(seconds=3)
+    res = client.get("/power/stream/1", params={
+        "from_ts": from_utc.isoformat(), "to_ts": to_utc.isoformat()})
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert len(data["buckets"]) > 0
+    # 399-400: Die erste Probe (offset 0 = "now") kann je nach Rundung bei
+    # der UTC->Lokal-Normalisierung knapp aus dem Fenster fallen.
+    assert sum(b["n"] for b in data["buckets"]) in (399, 400)
+    # to_ts-Antwort ist wieder naive Lokalzeit (keine Zonen-Suffixe)
+    assert "+" not in data["to_ts"] and not data["to_ts"].endswith("Z")

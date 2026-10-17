@@ -1259,11 +1259,22 @@ def power_stream_endpoint(
 
 
 def _parse_iso_or_422(value: str, name: str) -> datetime.datetime:
-    """ISO-Zeitstempel parsen; 422 bei ungueltigem Format."""
+    """
+    ISO-Zeitstempel parsen; 422 bei ungueltigem Format.
+
+    Zeitstempel mit Zeitzonen-Suffix (z. B. "...Z" vom Browser-toISOString)
+    werden auf naive LOKALZEIT normalisiert: Die DB (sessions.start_time,
+    power_measurements.measured_at) speichert naive Server-Lokalzeit, und
+    ein aware/naive-Vergleich wuerde crashen bzw. UTC-Lokalzeit-Differenzen
+    (sommer/winterzeit) in Fenster- und Session-Zuordnung verwurschten.
+    """
     try:
-        return datetime.datetime.fromisoformat(value)
+        dt = datetime.datetime.fromisoformat(value)
     except (ValueError, TypeError):
         raise HTTPException(status_code=422, detail=f"{name} ist kein gueltiger ISO-Zeitstempel.")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
 
 
 def _sessions_overlapping(from_dt: datetime.datetime,
